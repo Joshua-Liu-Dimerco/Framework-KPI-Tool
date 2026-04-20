@@ -122,21 +122,35 @@ def get_base_date(created_date, created_time_str, country):
     return base_date.normalize()
 
 
-def add_business_holiday_offset(start_date, days_to_add, holidays):
+def add_business_holiday_offset(start_date, days_to_add, holidays, special_rule_dict=None):
     if pd.isna(start_date):
         return pd.NaT
-
-    result_date = pd.to_datetime(start_date)
 
     if pd.isna(days_to_add):
         return pd.NaT
 
+    if special_rule_dict is None:
+        special_rule_dict = {}
+
+    result_date = pd.to_datetime(start_date).normalize()
+
+    # 先加原本 KPI 規則天數
     result_date = result_date + pd.Timedelta(days=int(days_to_add))
 
     holiday_set = {pd.to_datetime(d).date() for d in holidays}
 
+    # 如果落在 holiday，往後推
     while result_date.date() in holiday_set:
         result_date = result_date + pd.Timedelta(days=1)
+
+    # 再套用 special date 額外加天數
+    extra_days = special_rule_dict.get(result_date.date(), 0)
+    if pd.notna(extra_days) and int(extra_days) != 0:
+        result_date = result_date + pd.Timedelta(days=int(extra_days))
+
+        # 加完後如果又碰到 holiday，再往後推
+        while result_date.date() in holiday_set:
+            result_date = result_date + pd.Timedelta(days=1)
 
     return result_date
 
@@ -161,16 +175,17 @@ def prepare_data(df: pd.DataFrame, special_rule_dict=None) -> pd.DataFrame:
     df["Committed Day"] = df["Committed Date"].dt.date
 
     # KPI logic
+        # KPI logic
     df["Region"] = df["Country code"].apply(get_region)
 
     df["Base Date"] = df.apply(
-    lambda row: get_base_date(
-        row["Created Date"],
-        row["Created Time"],
-        row["Country code"]
-    ),
-    axis=1
-)
+        lambda row: get_base_date(
+            row["Created Date"],
+            row["Created Time"],
+            row["Country code"]
+        ),
+        axis=1
+    )
 
     df["Weekday No"] = df["Base Date"].dt.weekday + 1  # Monday=1 ... Sunday=7
 
@@ -180,9 +195,15 @@ def prepare_data(df: pd.DataFrame, special_rule_dict=None) -> pd.DataFrame:
     )
 
     df["KPI Failed Date"] = df.apply(
-        lambda row: add_business_holiday_offset(row["Base Date"], row["Transit Days"], HOLIDAYS),
+        lambda row: add_business_holiday_offset(
+            row["Base Date"],
+            row["Transit Days"],
+            HOLIDAYS,
+            special_rule_dict if row["Country code"] == "TW" else {}
+        ),
         axis=1
     )
+
     df["945 Day"] = pd.to_datetime(df["Committed Date"], errors="coerce").dt.date
     df["Need Fulfill Day"] = pd.to_datetime(df["KPI Failed Date"], errors="coerce").dt.date
 
@@ -245,7 +266,122 @@ def build_summary(df: pd.DataFrame) -> pd.DataFrame:
         .sort_values(["Order Day", "Status Group"])
     )
     return summary
+import re
 
+# ===== Inbound 專用 =====
+
+def normalize_decl_no(value):
+    if pd.isna(value):
+        return ""
+
+    value = str(value).strip().upper()
+    value = re.sub(r"[^A-Z0-9]", "", value)
+    return value
+
+
+@st.cache_data
+def load_inbound_raw(uploaded_file):
+    df = pd.read_excel(uploaded_file)
+    df.columns = [str(col).strip() for col in df.columns]
+    return df
+
+
+@st.cache_data
+def load_inbound_mapping(uploaded_file):
+    df = pd.read_excel(uploaded_file)
+    df.columns = [str(col).strip() for col in df.columns]
+
+    df["報單單號 Clean"] = df["報單單號"].apply(normalize_decl_no)
+    df["Inbound Date"] = pd.to_datetime(df["Inbound Date"], errors="coerce")
+
+    return df
+
+
+def calculate_inbound_kpi_date(inbound_date):
+    if pd.isna(inbound_date):
+        return pd.NaT
+
+    result_date = pd.to_datetime(inbound_date) + pd.Timedelta(days=1)
+
+    weekday = result_date.weekday()
+
+    if weekday == 5:  # Saturday
+        result_date += pd.Timedelta(days=2)
+    elif weekday == 6:  # Sunday
+        result_date += pd.Timedelta(days=1)
+
+    return result_date.normalize()
+
+
+def prepare_inbound_data(raw_df, mapping_df):
+    df = raw_df.copy()
+
+    df.columns = [str(col).strip() for col in df.columns]
+
+    # 清洗報單
+    df["Declaration Clean"] = df["Declaration#"].apply(normalize_decl_no)
+
+    mapping_dict = (
+        mapping_df.dropna(subset=["報單單號 Clean", "Inbound Date"])
+        .drop_duplicates(subset=["報單單號 Clean"], keep="first")
+        .set_index("報單單號 Clean")["Inbound Date"]
+        .to_dict()
+    )
+
+    df["Mapped Inbound Date"] = df["Declaration Clean"].map(mapping_dict)
+
+    df["Mapping Status"] = df["Mapped Inbound Date"].apply(
+        lambda x: "Matched" if pd.notna(x) else "確認報單號碼"
+    )
+
+    df["Need Fulfill Date"] = df["Mapped Inbound Date"].apply(calculate_inbound_kpi_date)
+    df["KPI Failed Date"] = df["Need Fulfill Date"]
+
+# ⭐ KPI 判斷（這是你缺的核心）
+    df["Actual Date"] = pd.to_datetime(df["Date"], errors="coerce")
+
+    df["KPI Result"] = df.apply(
+    lambda row: "Failed"
+    if pd.notna(row["Actual Date"])
+       and pd.notna(row["Need Fulfill Date"])
+       and row["Actual Date"] > row["Need Fulfill Date"]
+    else "In KPI",
+    axis=1
+)
+
+    return df
+
+    return df
+
+
+def build_inbound_kpi_summary(df):
+
+    df = df.copy()
+
+    df["Actual Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
+
+    summary = (
+        df.dropna(subset=["Actual Date"])
+        .groupby("Actual Date")
+        .agg(
+            in_kpi=("KPI Result", lambda x: (x == "In KPI").sum()),
+            failed=("KPI Result", lambda x: (x == "Failed").sum())
+        )
+        .reset_index()
+        .rename(columns={"Actual Date": "Report Date"})
+    )
+
+    summary["total"] = summary["in_kpi"] + summary["failed"]
+
+    summary["kpi_rate"] = summary.apply(
+        lambda row: row["in_kpi"] / row["total"]
+        if row["total"] > 0 else 1,
+        axis=1
+    )
+
+    summary = summary.sort_values("Report Date")
+
+    return summary
 
 def export_summary_excel(clean_df: pd.DataFrame, summary_df: pd.DataFrame) -> bytes:
     output = io.BytesIO()
@@ -313,100 +449,281 @@ def build_outbound_kpi_chart(summary_df: pd.DataFrame):
 )
 
     return fig
+def build_inbound_kpi_chart(summary_df):
 
-st.title("Framework Outbound KPI Tool")
+    fig = go.Figure()
 
-uploaded_file = st.file_uploader("Upload raw data (.xlsx)", type=["xlsx"])
-special_rule_file = st.file_uploader("Upload special date rule (.xlsx)", type=["xlsx"])
+    fig.add_trace(go.Bar(
+        x=summary_df["Report Date"],
+        y=summary_df["in_kpi"],
+        name="In KPI"
+    ))
 
-if uploaded_file is not None:
-    raw_df = load_data(uploaded_file)
+    fig.add_trace(go.Bar(
+        x=summary_df["Report Date"],
+        y=summary_df["failed"],
+        name="Failed"
+    ))
 
-    special_rule_dict = {}
+    fig.add_trace(go.Scatter(
+        x=summary_df["Report Date"],
+        y=summary_df["kpi_rate"],
+        name="KPI Rate",
+        mode="lines+markers",
+        yaxis="y2"
+    ))
 
-    if special_rule_file is not None:
-        special_df = load_special_rules(special_rule_file)
-        special_rule_dict = build_special_rule_dict(special_df)
+    fig.update_layout(
+        title="Inbound KPI",
+        barmode="stack",
+        xaxis=dict(
+            title="Date",
+            tickformat="%Y-%m-%d"
+        ),
+        yaxis=dict(title="Volume"),
+        yaxis2=dict(
+            title="KPI Rate",
+            overlaying="y",
+            side="right",
+            tickformat=".0%"
+        ),
+        legend=dict(orientation="h"),
+        height=600
+    )
 
-    df = prepare_data(raw_df, special_rule_dict)
+    return fig
 
-    summary_df = build_daily_kpi_summary(df)
+st.title("Framework KPI Tool")
 
-    # ===== 日期篩選 =====
-    if not summary_df.empty:
-        min_date = pd.to_datetime(summary_df["Report Date"]).min().date()
-        max_date = pd.to_datetime(summary_df["Report Date"]).max().date()
+tab1, tab2 = st.tabs(["Outbound KPI", "Inbound KPI"])
 
-        date_range = st.date_input(
-            "Select date range",
-            value=(min_date, max_date),
-            min_value=min_date,
-            max_value=max_date
-        )
+with tab1:
 
-        if isinstance(date_range, tuple) and len(date_range) == 2:
-            start_date, end_date = date_range
+    # ===== Upload =====
+    uploaded_file = st.file_uploader("Upload raw data (.xlsx)", type=["xlsx"])
+    special_rule_file = st.file_uploader("Upload special date rule (.xlsx)", type=["xlsx"])
 
-            filtered_summary_df = summary_df[
-                (pd.to_datetime(summary_df["Report Date"]).dt.date >= start_date) &
-                (pd.to_datetime(summary_df["Report Date"]).dt.date <= end_date)
-            ].copy()
+    if uploaded_file is not None:
 
-            filtered_df = df[
-                (pd.to_datetime(df["Need Fulfill Day"]).dt.date >= start_date) &
-                (pd.to_datetime(df["Need Fulfill Day"]).dt.date <= end_date)
-            ].copy()
+        # ===== Load Data =====
+        raw_df = load_data(uploaded_file)
+
+        special_rule_dict = {}
+
+        if special_rule_file is not None:
+            special_df = load_special_rules(special_rule_file)
+            special_rule_dict = build_special_rule_dict(special_df)
+
+        # ===== Prepare KPI =====
+        df = prepare_data(raw_df, special_rule_dict)
+        summary_df = build_daily_kpi_summary(df)
+
+        # ===== 日期篩選 =====
+        if not summary_df.empty:
+            min_date = pd.to_datetime(summary_df["Report Date"]).min().date()
+            max_date = pd.to_datetime(summary_df["Report Date"]).max().date()
+
+            date_range = st.date_input(
+                "Select date range",
+                value=(min_date, max_date),
+                min_value=min_date,
+                max_value=max_date
+            )
+
+            if isinstance(date_range, tuple) and len(date_range) == 2:
+                start_date, end_date = date_range
+
+                filtered_summary_df = summary_df[
+                    (pd.to_datetime(summary_df["Report Date"]).dt.date >= start_date) &
+                    (pd.to_datetime(summary_df["Report Date"]).dt.date <= end_date)
+                ].copy()
+
+                filtered_df = df[
+                    (pd.to_datetime(df["Need Fulfill Day"]).dt.date >= start_date) &
+                    (pd.to_datetime(df["Need Fulfill Day"]).dt.date <= end_date)
+                ].copy()
+            else:
+                filtered_summary_df = summary_df.copy()
+                filtered_df = df.copy()
         else:
             filtered_summary_df = summary_df.copy()
             filtered_df = df.copy()
+
+        # ===== KPI 指標 =====
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total Rows", f"{len(filtered_df):,}")
+        col2.metric("Complete", f"{(filtered_df['Status Group'] == 'Complete').sum():,}")
+        col3.metric("PGI", f"{(filtered_df['Status Group'] == 'PGI').sum():,}")
+        col4.metric("Void", f"{(filtered_df['Status Group'] == 'Void').sum():,}")
+
+        # ===== 圖表 =====
+        st.subheader("Outbound KPI Chart")
+        fig_kpi = build_outbound_kpi_chart(filtered_summary_df)
+        st.plotly_chart(fig_kpi, width="stretch")
+
+        # ===== Summary =====
+        display_summary_df = filtered_summary_df.rename(columns={
+            "Report Date": "Date",
+            "total_945": "945",
+            "need_fulfill": "Need Fulfill",
+            "in_kpi": "In KPI",
+            "failed": "Failed",
+            "kpi_rate": "KPI Rate"
+        })
+
+        display_summary_df["KPI Rate"] = display_summary_df["KPI Rate"].map(lambda x: f"{x:.2%}")
+
+        st.subheader("Daily KPI Summary")
+        st.dataframe(display_summary_df, width="stretch")
+
+        # ===== 明細 =====
+        st.subheader("Processed Data Preview")
+        display_df = filtered_df.copy()
+
+        date_cols = ["Committed Date", "Created Date", "Base Date", "KPI Failed Date"]
+
+        for col in date_cols:
+            if col in display_df.columns:
+                display_df[col] = pd.to_datetime(display_df[col], errors="coerce").dt.date
+
+        st.dataframe(display_df, width="stretch")
+
+        # ===== Raw =====
+        st.subheader("Raw Data Preview")
+        st.dataframe(raw_df, width="stretch")
+
     else:
-        filtered_summary_df = summary_df.copy()
-        filtered_df = df.copy()
+        st.info("Please upload your raw data Excel file to begin.")
+with tab2:
+    st.subheader("Inbound KPI Module")
 
-    # ===== KPI 指標 =====
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Total Rows", f"{len(filtered_df):,}")
-    col2.metric("Complete", f"{(filtered_df['Status Group'] == 'Complete').sum():,}")
-    col3.metric("PGI", f"{(filtered_df['Status Group'] == 'PGI').sum():,}")
-    col4.metric("Void", f"{(filtered_df['Status Group'] == 'Void').sum():,}")
+    inbound_raw_file = st.file_uploader(
+        "Upload Inbound Raw Data (.xlsx)",
+        type=["xlsx"],
+        key="inbound_raw"
+    )
 
-    # ===== 圖表 =====
-    st.subheader("Outbound KPI Chart")
-    fig_kpi = build_outbound_kpi_chart(filtered_summary_df)
-    st.plotly_chart(fig_kpi, width="stretch")
+    inbound_mapping_file = st.file_uploader(
+        "Upload Declaration Mapping File (.xlsx)",
+        type=["xlsx"],
+        key="inbound_mapping"
+    )
 
-    # ===== Summary 表 =====
-    display_summary_df = filtered_summary_df.rename(columns={
-        "Report Date": "Date",
-        "total_945": "945",
-        "need_fulfill": "Need Fulfill",
-        "in_kpi": "In KPI",
-        "failed": "Failed",
-        "kpi_rate": "KPI Rate"
-    })
+    if inbound_raw_file is not None and inbound_mapping_file is not None:
 
-    display_summary_df["KPI Rate"] = display_summary_df["KPI Rate"].map(lambda x: f"{x:.2%}")
+        # ===== Load Data =====
+        raw_df = load_inbound_raw(inbound_raw_file)
+        mapping_df = load_inbound_mapping(inbound_mapping_file)
 
-    st.subheader("Daily KPI Summary")
-    st.dataframe(display_summary_df, width="stretch")
-    st.subheader("Processed Data Preview")
-    display_df = filtered_df.copy()
+        # ===== Prepare Data =====
+        inbound_df = prepare_inbound_data(raw_df, mapping_df)
 
-    date_cols = [
-    "Committed Date",
-    "Created Date",
-    "Base Date",
-    "KPI Failed Date"
-]
+        # ===== 日期篩選 =====
+        inbound_df["Actual Date"] = pd.to_datetime(inbound_df["Date"], errors="coerce")
 
-    for col in date_cols:
-     if col in display_df.columns:
-        display_df[col] = pd.to_datetime(display_df[col], errors="coerce").dt.date
+        if not inbound_df["Actual Date"].dropna().empty:
+            min_date = inbound_df["Actual Date"].min().date()
+            max_date = inbound_df["Actual Date"].max().date()
 
-    st.dataframe(display_df, width="stretch")
-  
+            date_range = st.date_input(
+                "Select date range",
+                value=(min_date, max_date),
+                min_value=min_date,
+                max_value=max_date,
+                key="inbound_date"
+            )
 
-    st.subheader("Raw Data Preview")
-    st.dataframe(raw_df, width="stretch")
-else:
-    st.info("Please upload your raw data Excel file to begin.")
+            if isinstance(date_range, tuple) and len(date_range) == 2:
+                start_date, end_date = date_range
+
+                filtered_inbound_df = inbound_df[
+                    (inbound_df["Actual Date"].dt.date >= start_date) &
+                    (inbound_df["Actual Date"].dt.date <= end_date)
+                ].copy()
+            else:
+                filtered_inbound_df = inbound_df.copy()
+        else:
+            filtered_inbound_df = inbound_df.copy()
+
+        # ===== KPI Summary =====
+        inbound_summary_df = build_inbound_kpi_summary(filtered_inbound_df)
+
+        # ===== Failed item list =====
+        failed_items_df = filtered_inbound_df[
+            filtered_inbound_df["KPI Result"] == "Failed"
+        ].copy()
+
+        if not failed_items_df.empty:
+            failed_items_df["Mapped Inbound Date"] = pd.to_datetime(
+                failed_items_df["Mapped Inbound Date"], errors="coerce"
+            ).dt.date
+
+            failed_items_df["Date"] = pd.to_datetime(
+                failed_items_df["Date"], errors="coerce"
+            ).dt.date
+
+            failed_items_display_df = failed_items_df[
+                ["Vendor", "Mapped Inbound Date", "Date", "INBSHIP No.", "Declaration#", "PCS QTY"]
+            ].rename(columns={
+                "Mapped Inbound Date": "Inbound Date",
+                "Date": "Complete Date"
+            })
+        else:
+            failed_items_display_df = pd.DataFrame(
+                columns=["Vendor", "Inbound Date", "Complete Date", "INBSHIP No.", "Declaration#", "PCS QTY"]
+            )
+
+        # ===== KPI 指標 =====
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total Rows", f"{len(filtered_inbound_df):,}")
+        col2.metric("Matched", f"{(filtered_inbound_df['Mapping Status'] == 'Matched').sum():,}")
+        col3.metric("Need Confirm", f"{(filtered_inbound_df['Mapping Status'] == '確認報單號碼').sum():,}")
+        col4.metric("Failed", f"{(filtered_inbound_df['KPI Result'] == 'Failed').sum():,}")
+
+        # ===== KPI Chart =====
+        st.subheader("Inbound KPI Chart")
+        if not inbound_summary_df.empty:
+            fig = build_inbound_kpi_chart(inbound_summary_df)
+            st.plotly_chart(fig, width="stretch")
+        else:
+            st.info("No KPI data available for the selected date range.")
+
+        # ===== Summary =====
+        st.subheader("Inbound KPI Summary")
+        if not inbound_summary_df.empty:
+            display_inbound_summary_df = inbound_summary_df.copy()
+            display_inbound_summary_df["kpi_rate"] = display_inbound_summary_df["kpi_rate"].map(lambda x: f"{x:.2%}")
+            display_inbound_summary_df = display_inbound_summary_df.rename(columns={
+                "Report Date": "Date",
+                "in_kpi": "In KPI",
+                "failed": "Failed",
+                "total": "Total",
+                "kpi_rate": "KPI Rate"
+            })
+            st.dataframe(display_inbound_summary_df, width="stretch")
+        else:
+            st.info("No summary data available for the selected date range.")
+
+        # ===== Failed List =====
+        st.subheader("Failed Item List")
+        st.dataframe(failed_items_display_df, width="stretch")
+
+        # ===== Need Confirm =====
+        st.subheader("Need Confirm List")
+        unmatched_df = filtered_inbound_df[
+            filtered_inbound_df["Mapping Status"] == "確認報單號碼"
+        ].copy()
+        st.dataframe(unmatched_df, width="stretch")
+
+        # ===== Processed Data =====
+        st.subheader("Processed Data")
+        display_df = filtered_inbound_df.copy()
+
+        for col in ["Mapped Inbound Date", "Need Fulfill Date", "KPI Failed Date", "Actual Date"]:
+            if col in display_df.columns:
+                display_df[col] = pd.to_datetime(display_df[col], errors="coerce").dt.date
+
+        st.dataframe(display_df, width="stretch")
+
+    else:
+        st.info("Please upload both files.")
