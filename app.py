@@ -46,6 +46,9 @@ HOLIDAYS = [
     # "2026-02-28",
 ]
 
+# 倉庫使用率分頁的儲位類型清單
+STORAGE_TYPES = ["RCK", "LAR", "SHF", "MED"]
+
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(col).strip() for col in df.columns]
@@ -217,7 +220,7 @@ def prepare_data(df: pd.DataFrame, special_rule_dict=None) -> pd.DataFrame:
     )
 
     return df
-    
+
 def build_daily_kpi_summary(df: pd.DataFrame) -> pd.DataFrame:
     daily_945 = (
         df.dropna(subset=["945 Day"])
@@ -256,7 +259,7 @@ def build_daily_kpi_summary(df: pd.DataFrame) -> pd.DataFrame:
     summary = summary.sort_values("Report Date")
     summary["Report Date"] = summary["Report Date"].dt.date
 
-    return summary  
+    return summary
 
 def build_summary(df: pd.DataFrame) -> pd.DataFrame:
     summary = (
@@ -493,9 +496,232 @@ def build_inbound_kpi_chart(summary_df):
 
     return fig
 
+
+# ===== Warehouse Utilization (倉庫儲位使用率) =====
+
+def _normalize_loc_code(value) -> str:
+    """把儲位代碼統一成大寫去空白，避免比對失敗。"""
+    if pd.isna(value):
+        return ""
+    return str(value).strip().upper()
+
+
+@st.cache_data
+def load_storage_master(uploaded_file) -> pd.DataFrame:
+    """讀取儲位總表。預期欄位：Location, Type。"""
+    # 先試讀指定的工作表，若不存在則讀第一個
+    try:
+        df = pd.read_excel(uploaded_file, sheet_name="工作表1")
+    except Exception:
+        df = pd.read_excel(uploaded_file, sheet_name=0)
+
+    df = normalize_columns(df)
+
+    # 自動找 Location / Type 欄
+    loc_col = None
+    type_col = None
+    for col in df.columns:
+        col_lower = str(col).strip().lower()
+        if loc_col is None and col_lower in ("location", "locationcode", "儲位", "儲位代碼"):
+            loc_col = col
+        if type_col is None and col_lower in ("type", "類別", "儲位類別"):
+            type_col = col
+
+    if loc_col is None or type_col is None:
+        # 無法自動辨識，回傳空表
+        return pd.DataFrame(columns=["Location", "Type"])
+
+    df = df[[loc_col, type_col]].rename(columns={loc_col: "Location", type_col: "Type"})
+    df["Location"] = df["Location"].apply(_normalize_loc_code)
+    df["Type"] = df["Type"].astype(str).str.strip().str.upper()
+    df = df[df["Location"] != ""].drop_duplicates(subset=["Location"], keep="first")
+    return df.reset_index(drop=True)
+
+
+@st.cache_data
+def load_storage_usage(uploaded_file) -> pd.DataFrame:
+    """讀取實際庫存使用報表。預期欄位：LocationCode, itemcode, ItemDesc, Storage, Staging, Defective。"""
+    try:
+        df = pd.read_excel(uploaded_file, sheet_name="OrderReport")
+    except Exception:
+        df = pd.read_excel(uploaded_file, sheet_name=0)
+
+    df = normalize_columns(df)
+
+    # 自動找 LocationCode 欄
+    loc_col = None
+    for col in df.columns:
+        if str(col).strip().lower() in ("locationcode", "location", "儲位", "儲位代碼"):
+            loc_col = col
+            break
+
+    if loc_col is None:
+        return pd.DataFrame(columns=["LocationCode"])
+
+    if loc_col != "LocationCode":
+        df = df.rename(columns={loc_col: "LocationCode"})
+
+    df["LocationCode"] = df["LocationCode"].apply(_normalize_loc_code)
+
+    # 把 Storage/Staging/Defective 轉成數字（若存在）
+    for q_col in ["Storage", "Staging", "Defective"]:
+        if q_col in df.columns:
+            df[q_col] = pd.to_numeric(df[q_col], errors="coerce").fillna(0)
+
+    df = df[df["LocationCode"] != ""].copy()
+    return df.reset_index(drop=True)
+
+
+def build_utilization_summary(master_df: pd.DataFrame, usage_df: pd.DataFrame):
+    """
+    回傳:
+      type_summary_df  : 每個 Type 的 Total / Used / Empty / Utilization
+      overall_summary  : dict, 總儲位使用率
+      unmatched_df     : usage_df 中不存在於 master 的儲位 (暫時撿貨儲位，已被略過)
+      used_locations   : set, master 中被使用到的 Location
+    """
+    if master_df is None or master_df.empty:
+        empty = pd.DataFrame(columns=["Type", "Total", "Used", "Empty", "Utilization"])
+        return empty, {"total": 0, "used": 0, "empty": 0, "utilization": 0.0}, pd.DataFrame(), set()
+
+    master_locations = set(master_df["Location"].unique())
+
+    if usage_df is None or usage_df.empty:
+        usage_locations = set()
+    else:
+        usage_locations = set(usage_df["LocationCode"].unique())
+
+    # 在 usage 但不在 master → 暫時撿貨儲位，略過
+    unmatched_locs = usage_locations - master_locations
+    if usage_df is not None and not usage_df.empty:
+        unmatched_df = usage_df[usage_df["LocationCode"].isin(unmatched_locs)].copy()
+    else:
+        unmatched_df = pd.DataFrame()
+
+    # 真正算進使用率的「使用中儲位」= master 與 usage 的交集
+    used_locations = master_locations & usage_locations
+
+    # 依 Type 統計
+    rows = []
+    for t in STORAGE_TYPES:
+        type_locs = set(master_df.loc[master_df["Type"] == t, "Location"])
+        total = len(type_locs)
+        used = len(type_locs & used_locations)
+        empty = total - used
+        rate = (used / total) if total > 0 else 0.0
+        rows.append({
+            "Type": t,
+            "Total": total,
+            "Used": used,
+            "Empty": empty,
+            "Utilization": rate,
+        })
+
+    # 處理可能存在的其他 Type（不在 STORAGE_TYPES 清單中的）
+    other_types = set(master_df["Type"].unique()) - set(STORAGE_TYPES)
+    for t in sorted(other_types):
+        type_locs = set(master_df.loc[master_df["Type"] == t, "Location"])
+        total = len(type_locs)
+        used = len(type_locs & used_locations)
+        empty = total - used
+        rate = (used / total) if total > 0 else 0.0
+        rows.append({
+            "Type": t,
+            "Total": total,
+            "Used": used,
+            "Empty": empty,
+            "Utilization": rate,
+        })
+
+    type_summary_df = pd.DataFrame(rows)
+
+    total_all = len(master_locations)
+    used_all = len(used_locations)
+    overall_summary = {
+        "total": total_all,
+        "used": used_all,
+        "empty": total_all - used_all,
+        "utilization": (used_all / total_all) if total_all > 0 else 0.0,
+    }
+
+    return type_summary_df, overall_summary, unmatched_df, used_locations
+
+
+def build_utilization_chart(type_summary_df: pd.DataFrame):
+    fig = go.Figure()
+
+    fig.add_trace(go.Bar(
+        x=type_summary_df["Type"],
+        y=type_summary_df["Used"],
+        name="Used",
+        marker_color="#1f77b4",
+    ))
+
+    fig.add_trace(go.Bar(
+        x=type_summary_df["Type"],
+        y=type_summary_df["Empty"],
+        name="Empty",
+        marker_color="#d3d3d3",
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=type_summary_df["Type"],
+        y=type_summary_df["Utilization"],
+        name="Utilization",
+        mode="lines+markers+text",
+        text=[f"{v:.1%}" for v in type_summary_df["Utilization"]],
+        textposition="top center",
+        yaxis="y2",
+        line=dict(color="#ff7f0e"),
+    ))
+
+    fig.update_layout(
+        title="Warehouse Utilization by Type",
+        barmode="stack",
+        xaxis=dict(title="Storage Type"),
+        yaxis=dict(title="Locations"),
+        yaxis2=dict(
+            title="Utilization",
+            overlaying="y",
+            side="right",
+            tickformat=".0%",
+            range=[0, 1.1],
+        ),
+        legend=dict(orientation="h"),
+        height=500,
+    )
+
+    return fig
+
+
+def export_utilization_excel(
+    type_summary_df: pd.DataFrame,
+    overall_summary: dict,
+    used_detail_df: pd.DataFrame,
+    empty_detail_df: pd.DataFrame,
+    unmatched_df: pd.DataFrame,
+) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        overall_df = pd.DataFrame([{
+            "Total Locations": overall_summary["total"],
+            "Used": overall_summary["used"],
+            "Empty": overall_summary["empty"],
+            "Utilization": overall_summary["utilization"],
+        }])
+        overall_df.to_excel(writer, sheet_name="Overall", index=False)
+
+        type_summary_df.to_excel(writer, sheet_name="By_Type", index=False)
+        used_detail_df.to_excel(writer, sheet_name="Used_Locations", index=False)
+        empty_detail_df.to_excel(writer, sheet_name="Empty_Locations", index=False)
+        unmatched_df.to_excel(writer, sheet_name="Temp_Picking_Locations", index=False)
+    output.seek(0)
+    return output.getvalue()
+
+
 st.title("Framework KPI Tool")
 
-tab1, tab2 = st.tabs(["Outbound KPI", "Inbound KPI"])
+tab1, tab2, tab3 = st.tabs(["Outbound KPI", "Inbound KPI", "Warehouse Utilization"])
 
 with tab1:
 
@@ -727,3 +953,128 @@ with tab2:
 
     else:
         st.info("Please upload both files.")
+
+with tab3:
+    st.subheader("Warehouse Utilization Module")
+    st.caption(
+        "上傳「儲位總表」與「實際庫存使用報表」後，系統會計算總儲位使用率與 RCK / LAR / SHF / MED 的個別使用率。\n"
+        "若實際使用報表中的儲位不在儲位總表內，將視為暫時撿貨儲位並從計算中略過。"
+    )
+
+    storage_master_file = st.file_uploader(
+        "Upload Storage Master (儲位總表 .xlsx)",
+        type=["xlsx"],
+        key="storage_master",
+    )
+
+    storage_usage_file = st.file_uploader(
+        "Upload Storage Usage Report (實際庫存報表 .xlsx)",
+        type=["xlsx"],
+        key="storage_usage",
+    )
+
+    if storage_master_file is not None and storage_usage_file is not None:
+
+        # ===== Load =====
+        master_df = load_storage_master(storage_master_file)
+        usage_df = load_storage_usage(storage_usage_file)
+
+        if master_df.empty:
+            st.error("無法從儲位總表讀到 Location/Type 欄位，請確認檔案格式。")
+        elif usage_df.empty:
+            st.error("無法從實際庫存報表讀到 LocationCode 欄位，請確認檔案格式。")
+        else:
+            type_summary_df, overall_summary, unmatched_df, used_locations = build_utilization_summary(
+                master_df, usage_df
+            )
+
+            # ===== 總體使用率指標 =====
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("總儲位數", f"{overall_summary['total']:,}")
+            col2.metric("已使用", f"{overall_summary['used']:,}")
+            col3.metric("空儲位", f"{overall_summary['empty']:,}")
+            col4.metric("總使用率", f"{overall_summary['utilization']:.2%}")
+
+            # ===== Per-type 指標 (RCK / LAR / SHF / MED) =====
+            st.subheader("Utilization by Type")
+            type_cols = st.columns(len(STORAGE_TYPES))
+            for i, t in enumerate(STORAGE_TYPES):
+                row = type_summary_df[type_summary_df["Type"] == t]
+                if not row.empty:
+                    r = row.iloc[0]
+                    type_cols[i].metric(
+                        label=f"{t}  ({int(r['Used'])}/{int(r['Total'])})",
+                        value=f"{r['Utilization']:.2%}",
+                        delta=f"Empty: {int(r['Empty'])}",
+                        delta_color="off",
+                    )
+                else:
+                    type_cols[i].metric(label=t, value="N/A")
+
+            # ===== 圖表 =====
+            st.subheader("Utilization Chart")
+            fig_util = build_utilization_chart(type_summary_df)
+            st.plotly_chart(fig_util, width="stretch")
+
+            # ===== Summary 表 =====
+            st.subheader("Utilization Summary Table")
+            display_summary = type_summary_df.copy()
+            display_summary["Utilization"] = display_summary["Utilization"].map(lambda x: f"{x:.2%}")
+            st.dataframe(display_summary, width="stretch")
+
+            # ===== 空儲位明細 =====
+            st.subheader("Empty Locations (尚未使用的儲位)")
+            empty_detail_df = master_df[~master_df["Location"].isin(used_locations)].copy()
+            empty_detail_df = empty_detail_df.sort_values(["Type", "Location"]).reset_index(drop=True)
+            st.write(f"共 **{len(empty_detail_df):,}** 個空儲位")
+            st.dataframe(empty_detail_df, width="stretch")
+
+            # ===== 已使用儲位明細 (含庫存量) =====
+            st.subheader("Used Locations (使用中儲位)")
+            usage_agg_cols = [c for c in ["Storage", "Staging", "Defective"] if c in usage_df.columns]
+            if usage_agg_cols:
+                usage_agg = (
+                    usage_df.groupby("LocationCode")[usage_agg_cols]
+                    .sum()
+                    .reset_index()
+                )
+            else:
+                usage_agg = usage_df[["LocationCode"]].drop_duplicates().reset_index(drop=True)
+
+            used_detail_df = master_df[master_df["Location"].isin(used_locations)].merge(
+                usage_agg, left_on="Location", right_on="LocationCode", how="left"
+            )
+            if "LocationCode" in used_detail_df.columns:
+                used_detail_df = used_detail_df.drop(columns=["LocationCode"])
+            used_detail_df = used_detail_df.sort_values(["Type", "Location"]).reset_index(drop=True)
+            st.dataframe(used_detail_df, width="stretch")
+
+            # ===== 暫時撿貨儲位 (在 usage 但不在 master) =====
+            st.subheader("Temporary Picking Locations (略過計算的儲位)")
+            if unmatched_df.empty:
+                st.info("沒有暫時撿貨儲位 — 所有實際使用的儲位都能對應到儲位總表。")
+            else:
+                unmatched_unique = (
+                    unmatched_df["LocationCode"].drop_duplicates().sort_values().reset_index(drop=True)
+                )
+                st.write(f"共 **{len(unmatched_unique):,}** 個儲位不在儲位總表中（已從使用率計算中略過）")
+                st.dataframe(unmatched_df, width="stretch")
+
+            # ===== Download =====
+            st.subheader("Export")
+            excel_bytes = export_utilization_excel(
+                type_summary_df=type_summary_df,
+                overall_summary=overall_summary,
+                used_detail_df=used_detail_df,
+                empty_detail_df=empty_detail_df,
+                unmatched_df=unmatched_df,
+            )
+            st.download_button(
+                label="Download Utilization Report (.xlsx)",
+                data=excel_bytes,
+                file_name="warehouse_utilization_report.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+    else:
+        st.info("請同時上傳「儲位總表」與「實際庫存報表」以開始計算。")
