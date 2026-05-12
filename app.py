@@ -49,6 +49,100 @@ HOLIDAYS = [
 # 倉庫使用率分頁的儲位類型清單
 STORAGE_TYPES = ["RCK", "LAR", "SHF", "MED"]
 
+# ===== Inventory Item Master (從上傳的檔案讀取) =====
+# 在 Storage Usage 分頁需上傳 Item Master Excel，內含 itemcode → Item Type 對照。
+# 預期欄位：itemcode, Item Type （大小寫不拘，會自動正規化）。
+
+@st.cache_data
+def load_item_master(uploaded_file) -> dict:
+    """讀取 Item Master 檔案並回傳 {itemcode_upper: item_type} dict。
+
+    支援 .xlsx / .csv。會自動偵測 itemcode 與 Item Type 欄位名稱。
+    """
+    name = getattr(uploaded_file, "name", "") or ""
+    if name.lower().endswith(".csv"):
+        df = pd.read_csv(uploaded_file)
+    else:
+        # Excel：先試讀 OrderReport，否則第一個工作表
+        try:
+            df = pd.read_excel(uploaded_file, sheet_name="OrderReport")
+        except Exception:
+            df = pd.read_excel(uploaded_file, sheet_name=0)
+
+    df = normalize_columns(df)
+
+    # 自動找 itemcode 欄
+    code_col = None
+    type_col = None
+    for col in df.columns:
+        c = str(col).strip().lower()
+        if code_col is None and c in ("itemcode", "item code", "item_code", "framework pn", "pn", "料號", "品號"):
+            code_col = col
+        if type_col is None and c in ("item type", "itemtype", "item_type", "種類", "類別", "type"):
+            type_col = col
+
+    if code_col is None or type_col is None:
+        return {}
+
+    sub = df[[code_col, type_col]].dropna(how="all").copy()
+    sub[code_col] = sub[code_col].astype(str).str.strip().str.upper()
+    sub[type_col] = sub[type_col].astype(str).str.strip()
+
+    # 排除像「Total」這種總和列、空字串
+    sub = sub[(sub[code_col] != "") & (sub[code_col].str.upper() != "TOTAL")]
+    sub = sub[sub[type_col] != ""]
+
+    # 同 itemcode 重複時取第一筆
+    sub = sub.drop_duplicates(subset=[code_col], keep="first")
+
+    return dict(zip(sub[code_col], sub[type_col]))
+
+
+def get_item_type(itemcode, item_master=None) -> str:
+    """回傳 itemcode 對應的 Item Type；找不到或未提供 master 時回傳 'Unknown'。"""
+    if itemcode is None or not item_master:
+        return "Unknown"
+    key = str(itemcode).strip().upper()
+    if not key:
+        return "Unknown"
+    return item_master.get(key, "Unknown")
+
+
+def build_item_master_template_bytes() -> bytes:
+    """產生 Item Master 匯入範本 (.xlsx)，含正確欄名與幾筆示範資料。"""
+    sample_df = pd.DataFrame([
+        {"itemcode": "FRAEXAMPLE01", "Item Type": "Laptop"},
+        {"itemcode": "FRAEXAMPLE02", "Item Type": "Keyboard"},
+        {"itemcode": "FRAEXAMPLE03", "Item Type": "Accessories"},
+        {"itemcode": "FRAEXAMPLE04", "Item Type": "Mainboard"},
+        {"itemcode": "FRAEXAMPLE05", "Item Type": "SSD"},
+    ])
+
+    instructions_df = pd.DataFrame({
+        "說明 / Instructions": [
+            "1. 在『OrderReport』分頁填入 itemcode 與 Item Type 兩欄。",
+            "2. itemcode 為品號，會自動轉大寫去空白。",
+            "3. Item Type 為品項類別，可自訂；常見類別請參考下方清單。",
+            "4. 同 itemcode 重複時，會取第一筆。",
+            "5. 含『Total』字樣的列會被自動跳過。",
+            "",
+            "常見 Item Type 範例：",
+            "  Laptop / Mainboard / Keyboard / Input Cover / Bezel",
+            "  SSD / RAM / Power Adapter / Expansion / Accessories / Desktop",
+            "",
+            "也可改用以下欄名（系統會自動辨識）：",
+            "  itemcode 欄：itemcode / item code / Framework PN / 料號 / 品號",
+            "  Item Type 欄：Item Type / 種類 / 類別 / type",
+        ]
+    })
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        sample_df.to_excel(writer, sheet_name="OrderReport", index=False)
+        instructions_df.to_excel(writer, sheet_name="說明", index=False)
+    output.seek(0)
+    return output.getvalue()
+
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(col).strip() for col in df.columns]
@@ -957,7 +1051,8 @@ with tab2:
 with tab3:
     st.subheader("Warehouse Utilization Module")
     st.caption(
-        "上傳「儲位總表」與「實際庫存使用報表」後，系統會計算總儲位使用率與 RCK / LAR / SHF / MED 的個別使用率。\n"
+        "上傳「儲位總表」、「實際庫存使用報表」與「Item Master」後，系統會計算總儲位使用率與 RCK / LAR / SHF / MED 的個別使用率。\n"
+        "Item Master 用來把 itemcode 對應到 Item Type，方便依品項類別觀察使用率；若不上傳則所有品項會標示為 Unknown，仍可看總攬。\n"
         "若實際使用報表中的儲位不在儲位總表內，將視為暫時撿貨儲位並從計算中略過。"
     )
 
@@ -973,30 +1068,182 @@ with tab3:
         key="storage_usage",
     )
 
+    item_master_file = st.file_uploader(
+        "Upload Item Master (Inventory 對照表 .xlsx / .csv) — 選填",
+        type=["xlsx", "csv"],
+        key="item_master",
+        help="預期欄位：itemcode 與 Item Type（也接受 Framework PN / 種類 / 類別 等常見欄名）。每次重新整理頁面都需要重新上傳。",
+    )
+
+    # ===== Item Master 匯入範本下載 =====
+    st.download_button(
+        label="📥 下載 Item Master 匯入範本 (.xlsx)",
+        data=build_item_master_template_bytes(),
+        file_name="item_master_template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        help="下載空白範本，內含正確欄名與幾筆示範資料；填好後即可上傳。",
+        key="dl_item_master_template",
+    )
+
     if storage_master_file is not None and storage_usage_file is not None:
 
         # ===== Load =====
         master_df = load_storage_master(storage_master_file)
         usage_df = load_storage_usage(storage_usage_file)
 
+        # 讀 Item Master（選填）
+        if item_master_file is not None:
+            item_master_dict = load_item_master(item_master_file)
+            if not item_master_dict:
+                st.warning(
+                    "Item Master 上傳了但無法讀到 itemcode / Item Type 欄位，"
+                    "請確認檔案格式（需要兩欄：itemcode、Item Type）。將以 Unknown 處理。"
+                )
+        else:
+            item_master_dict = {}
+
         if master_df.empty:
             st.error("無法從儲位總表讀到 Location/Type 欄位，請確認檔案格式。")
         elif usage_df.empty:
             st.error("無法從實際庫存報表讀到 LocationCode 欄位，請確認檔案格式。")
         else:
-            type_summary_df, overall_summary, unmatched_df, used_locations = build_utilization_summary(
-                master_df, usage_df
+            # ===== 套用 Item Master 為 usage_df 加上 Item Type =====
+            usage_df = usage_df.copy()
+            if "itemcode" in usage_df.columns:
+                if item_master_dict:
+                    usage_df["Item Type"] = usage_df["itemcode"].apply(
+                        lambda x: get_item_type(x, item_master_dict)
+                    )
+                    matched_cnt = (usage_df["Item Type"] != "Unknown").sum()
+                    st.caption(
+                        f"Item Master 載入成功：共 **{len(item_master_dict):,}** 筆對照；"
+                        f"實際使用報表中匹配 **{matched_cnt:,}** / {len(usage_df):,} 筆。"
+                    )
+                else:
+                    usage_df["Item Type"] = "Unknown"
+                    st.info("尚未上傳 Item Master，所有品項暫時標記為 Unknown。")
+            else:
+                # 若沒有 itemcode 欄位則整批標記為 Unknown，仍可顯示總攬
+                usage_df["Item Type"] = "Unknown"
+                st.warning("實際庫存報表中找不到 itemcode 欄位，無法依 Item Type 進一步分類。")
+
+            # ===== 總體 (不分 Item Type) 使用率：作為「總攬」 =====
+            type_summary_all_df, overall_summary_all, unmatched_df, used_locations_all = (
+                build_utilization_summary(master_df, usage_df)
             )
 
-            # ===== 總體使用率指標 =====
+            st.markdown("### 總攬 (All Item Types)")
+
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("總儲位數", f"{overall_summary_all['total']:,}")
+            col2.metric("已使用", f"{overall_summary_all['used']:,}")
+            col3.metric("空儲位", f"{overall_summary_all['empty']:,}")
+            col4.metric("總使用率", f"{overall_summary_all['utilization']:.2%}")
+
+            # 總攬：每個 Location Type 的使用率指標
+            type_cols = st.columns(len(STORAGE_TYPES))
+            for i, t in enumerate(STORAGE_TYPES):
+                row = type_summary_all_df[type_summary_all_df["Type"] == t]
+                if not row.empty:
+                    r = row.iloc[0]
+                    type_cols[i].metric(
+                        label=f"{t}  ({int(r['Used'])}/{int(r['Total'])})",
+                        value=f"{r['Utilization']:.2%}",
+                        delta=f"Empty: {int(r['Empty'])}",
+                        delta_color="off",
+                    )
+                else:
+                    type_cols[i].metric(label=t, value="N/A")
+
+            # ===== Item Type × Location Type Breakdown (總攬交叉分析) =====
+            st.markdown("#### Item Type × Location Type 使用儲位數")
+            st.caption("每一格代表「該 Item Type 在該 Location Type 中所佔用的儲位數量」。")
+
+            # 用 master_df 取得 Location → Type 對照
+            loc_to_type = dict(zip(master_df["Location"], master_df["Type"]))
+
+            # 排除暫時撿貨儲位
+            usage_in_master_df = usage_df[usage_df["LocationCode"].isin(set(master_df["Location"]))].copy()
+            usage_in_master_df["Loc Type"] = usage_in_master_df["LocationCode"].map(loc_to_type)
+
+            # 每個 (Item Type, Loc Type) 對應到的「不重複 Location 數量」
+            breakdown_long = (
+                usage_in_master_df.dropna(subset=["Loc Type"])
+                .groupby(["Item Type", "Loc Type"])["LocationCode"]
+                .nunique()
+                .reset_index(name="Used Locations")
+            )
+
+            if not breakdown_long.empty:
+                # 透視成矩陣：列 = Item Type, 欄 = Location Type
+                ordered_loc_types = STORAGE_TYPES + sorted(
+                    set(breakdown_long["Loc Type"]) - set(STORAGE_TYPES)
+                )
+                breakdown_pivot = (
+                    breakdown_long.pivot(index="Item Type", columns="Loc Type", values="Used Locations")
+                    .fillna(0)
+                    .astype(int)
+                )
+                # 重排欄位順序
+                breakdown_pivot = breakdown_pivot.reindex(
+                    columns=[c for c in ordered_loc_types if c in breakdown_pivot.columns]
+                )
+                breakdown_pivot["Total"] = breakdown_pivot.sum(axis=1)
+                breakdown_pivot = breakdown_pivot.sort_values("Total", ascending=False)
+                st.dataframe(breakdown_pivot, width="stretch")
+            else:
+                st.info("沒有可顯示的 Item Type × Location Type 資料。")
+
+            # ===== Item Type 篩選器 =====
+            st.markdown("---")
+            st.markdown("### 依 Item Type 觀察")
+
+            # 收集出現過的 Item Types：以 usage 中真正出現的優先，加上 master 中已知的
+            usage_item_types = sorted(usage_df["Item Type"].dropna().unique())
+            item_type_options = ["全部 (All)"] + usage_item_types
+
+            selected_item_type = st.selectbox(
+                "選擇要分析的 Item Type",
+                options=item_type_options,
+                index=0,
+                key="storage_item_type_filter",
+                help="選『全部 (All)』可查看跨所有 Item Type 的使用率；選擇單一 Item Type 可看該品項在各 Location Type 的儲位佔用率。",
+            )
+
+            if selected_item_type == "全部 (All)":
+                filtered_usage_df = usage_df
+                type_summary_df = type_summary_all_df
+                overall_summary = overall_summary_all
+                used_locations = used_locations_all
+                scope_label = "全部 (All Item Types)"
+            else:
+                filtered_usage_df = usage_df[usage_df["Item Type"] == selected_item_type].copy()
+                type_summary_df, overall_summary, _unmatched_ignore, used_locations = (
+                    build_utilization_summary(master_df, filtered_usage_df)
+                )
+                scope_label = f"Item Type = {selected_item_type}"
+
+            st.markdown(f"**Scope**: {scope_label} ｜ 對應 itemcode 列數: {len(filtered_usage_df):,}")
+
+            # ===== 篩選後的總體指標 =====
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("總儲位數", f"{overall_summary['total']:,}")
-            col2.metric("已使用", f"{overall_summary['used']:,}")
-            col3.metric("空儲位", f"{overall_summary['empty']:,}")
-            col4.metric("總使用率", f"{overall_summary['utilization']:.2%}")
+            col2.metric(
+                "該 Item Type 佔用儲位",
+                f"{overall_summary['used']:,}",
+            )
+            col3.metric(
+                "該 Item Type 未佔用儲位",
+                f"{overall_summary['empty']:,}",
+            )
+            col4.metric(
+                "佔用率",
+                f"{overall_summary['utilization']:.2%}",
+                help="該 Item Type 佔用的儲位數 / 倉庫總儲位數",
+            )
 
-            # ===== Per-type 指標 (RCK / LAR / SHF / MED) =====
-            st.subheader("Utilization by Type")
+            # ===== Per-Location-Type 指標 (RCK / LAR / SHF / MED) =====
+            st.subheader(f"Utilization by Location Type — {scope_label}")
             type_cols = st.columns(len(STORAGE_TYPES))
             for i, t in enumerate(STORAGE_TYPES):
                 row = type_summary_df[type_summary_df["Type"] == t]
@@ -1022,24 +1269,24 @@ with tab3:
             display_summary["Utilization"] = display_summary["Utilization"].map(lambda x: f"{x:.2%}")
             st.dataframe(display_summary, width="stretch")
 
-            # ===== 空儲位明細 =====
-            st.subheader("Empty Locations (尚未使用的儲位)")
+            # ===== 空儲位明細 (相對於目前 scope) =====
+            st.subheader("Empty Locations (該 scope 下未被佔用的儲位)")
             empty_detail_df = master_df[~master_df["Location"].isin(used_locations)].copy()
             empty_detail_df = empty_detail_df.sort_values(["Type", "Location"]).reset_index(drop=True)
             st.write(f"共 **{len(empty_detail_df):,}** 個空儲位")
             st.dataframe(empty_detail_df, width="stretch")
 
-            # ===== 已使用儲位明細 (含庫存量) =====
-            st.subheader("Used Locations (使用中儲位)")
-            usage_agg_cols = [c for c in ["Storage", "Staging", "Defective"] if c in usage_df.columns]
+            # ===== 已使用儲位明細 (含庫存量, 套用 Item Type 篩選) =====
+            st.subheader(f"Used Locations — {scope_label}")
+            usage_agg_cols = [c for c in ["Storage", "Staging", "Defective"] if c in filtered_usage_df.columns]
             if usage_agg_cols:
                 usage_agg = (
-                    usage_df.groupby("LocationCode")[usage_agg_cols]
+                    filtered_usage_df.groupby("LocationCode")[usage_agg_cols]
                     .sum()
                     .reset_index()
                 )
             else:
-                usage_agg = usage_df[["LocationCode"]].drop_duplicates().reset_index(drop=True)
+                usage_agg = filtered_usage_df[["LocationCode"]].drop_duplicates().reset_index(drop=True)
 
             used_detail_df = master_df[master_df["Location"].isin(used_locations)].merge(
                 usage_agg, left_on="Location", right_on="LocationCode", how="left"
@@ -1049,7 +1296,7 @@ with tab3:
             used_detail_df = used_detail_df.sort_values(["Type", "Location"]).reset_index(drop=True)
             st.dataframe(used_detail_df, width="stretch")
 
-            # ===== 暫時撿貨儲位 (在 usage 但不在 master) =====
+            # ===== 暫時撿貨儲位 (在 usage 但不在 master)，固定使用全量 usage =====
             st.subheader("Temporary Picking Locations (略過計算的儲位)")
             if unmatched_df.empty:
                 st.info("沒有暫時撿貨儲位 — 所有實際使用的儲位都能對應到儲位總表。")
@@ -1069,10 +1316,14 @@ with tab3:
                 empty_detail_df=empty_detail_df,
                 unmatched_df=unmatched_df,
             )
+            file_name_scope = (
+                "all" if selected_item_type == "全部 (All)"
+                else selected_item_type.lower().replace(" ", "_")
+            )
             st.download_button(
-                label="Download Utilization Report (.xlsx)",
+                label=f"Download Utilization Report ({scope_label}) (.xlsx)",
                 data=excel_bytes,
-                file_name="warehouse_utilization_report.xlsx",
+                file_name=f"warehouse_utilization_{file_name_scope}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
