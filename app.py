@@ -296,7 +296,7 @@ def prepare_data(df: pd.DataFrame, special_rule_dict=None) -> pd.DataFrame:
             row["Base Date"],
             row["Transit Days"],
             HOLIDAYS,
-            special_rule_dict if row["Country code"] == "TW" else {}
+            special_rule_dict
         ),
         axis=1
     )
