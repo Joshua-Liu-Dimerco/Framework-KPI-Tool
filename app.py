@@ -49,6 +49,79 @@ HOLIDAYS = [
 # 倉庫使用率分頁的儲位類型清單
 STORAGE_TYPES = ["RCK", "LAR", "SHF", "MED"]
 
+
+# ===== 檔名日期 / 週數工具 =====
+import re as _re_fn
+
+def parse_date_from_filename(filename):
+    """從檔名 (例: CR_WMSv3_Framework_Storage_Usage_Report_2026-05-20.xlsx) 解析日期。"""
+    if not filename:
+        return None
+    m = _re_fn.search(r"(\d{4})[-_]?(\d{1,2})[-_]?(\d{1,2})", str(filename))
+    if not m:
+        return None
+    try:
+        return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).date()
+    except Exception:
+        return None
+
+
+def get_year_week_label(d):
+    """日期 -> 'YYYY Week NN' (ISO 週)。"""
+    if d is None:
+        return ""
+    if isinstance(d, str):
+        d = pd.to_datetime(d, errors="coerce")
+        if pd.isna(d):
+            return ""
+        d = d.date()
+    iso = d.isocalendar()
+    try:
+        return f"{iso.year} Week {iso.week:02d}"
+    except AttributeError:
+        return f"{iso[0]} Week {iso[1]:02d}"
+
+
+def dedup_files_by_week(pairs):
+    """同週多檔保留日期最晚的那筆。"""
+    bucket = {}
+    for f, d in pairs:
+        if d is None:
+            continue
+        wk = get_year_week_label(d)
+        if wk not in bucket or d > bucket[wk]["date"]:
+            bucket[wk] = {"file": f, "date": d, "week_label": wk}
+    return sorted(bucket.values(), key=lambda x: x["date"])
+
+
+# ===== Exception (排除訂單) 載入器 =====
+
+def load_exception_orders(uploaded_file):
+    """讀取 Exception 檔，回傳訂單號集合 (大寫去空白)。"""
+    if uploaded_file is None:
+        return set()
+    try:
+        df = pd.read_excel(uploaded_file, sheet_name=0)
+    except Exception:
+        return set()
+    df.columns = [str(c).strip() for c in df.columns]
+    target_col = None
+    for col in df.columns:
+        cl = str(col).strip().lower()
+        if cl in ("order", "order#", "orderno", "order no", "order_no",
+                  "docno", "doc no", "doc_no", "transno", "trans no",
+                  "inbship no.", "inbship no", "inbship_no",
+                  "declaration#", "declaration",
+                  "訂單", "訂單號", "訂單號碼", "單號"):
+            target_col = col
+            break
+    if target_col is None and len(df.columns) > 0:
+        target_col = df.columns[0]
+    if target_col is None or df.empty:
+        return set()
+    vals = df[target_col].dropna().astype(str).str.strip().str.upper()
+    return set(v for v in vals.tolist() if v)
+
 # ===== Inventory Item Master (從上傳的檔案讀取) =====
 # 在 Storage Usage 分頁需上傳 Item Master Excel，內含 itemcode → Item Type 對照。
 # 預期欄位：itemcode, Item Type （大小寫不拘，會自動正規化）。
@@ -788,6 +861,63 @@ def build_utilization_chart(type_summary_df: pd.DataFrame):
     return fig
 
 
+def build_weekly_trend_chart(weekly_df, selected_types):
+    """每週變化趨勢圖。主軸: 各 Storage Type 的 Used 疊加柱；副軸: 合計使用率折線。"""
+    fig = go.Figure()
+    if weekly_df is None or weekly_df.empty:
+        fig.update_layout(title="Weekly Storage Utilization Trend (尚無資料)")
+        return fig
+
+    week_order = (
+        weekly_df[["Week Label", "Date"]]
+        .drop_duplicates().sort_values("Date")["Week Label"].tolist()
+    )
+
+    types_to_plot = [t for t in selected_types if t in weekly_df["Type"].unique()]
+    if not types_to_plot:
+        types_to_plot = sorted(weekly_df["Type"].unique())
+
+    palette = {"RCK": "#1f77b4", "LAR": "#2ca02c", "SHF": "#9467bd", "MED": "#17becf"}
+
+    for t in types_to_plot:
+        sub = weekly_df[weekly_df["Type"] == t].set_index("Week Label").reindex(week_order)
+        fig.add_trace(go.Bar(
+            x=week_order,
+            y=sub["Used"].fillna(0).astype(int),
+            name=f"{t} Used",
+            marker_color=palette.get(t),
+        ))
+
+    rate_rows = []
+    for wk in week_order:
+        wk_sub = weekly_df[(weekly_df["Week Label"] == wk) & (weekly_df["Type"].isin(types_to_plot))]
+        total = wk_sub["Total"].sum()
+        used = wk_sub["Used"].sum()
+        rate_rows.append({"Week Label": wk, "Utilization": (used / total) if total > 0 else 0.0})
+    rate_df = pd.DataFrame(rate_rows)
+
+    fig.add_trace(go.Scatter(
+        x=rate_df["Week Label"], y=rate_df["Utilization"],
+        name="Utilization", mode="lines+markers+text",
+        text=[f"{v:.1%}" for v in rate_df["Utilization"]],
+        textposition="top center", yaxis="y2",
+        line=dict(color="#ff7f0e", width=3),
+    ))
+
+    fig.update_layout(
+        title="Weekly Storage Utilization Trend",
+        barmode="stack",
+        xaxis=dict(title="Year Week", type="category",
+                   categoryorder="array", categoryarray=week_order),
+        yaxis=dict(title="Used Locations"),
+        yaxis2=dict(title="Utilization", overlaying="y", side="right",
+                    tickformat=".0%", range=[0, 1.1]),
+        legend=dict(orientation="h"),
+        height=550,
+    )
+    return fig
+
+
 def export_utilization_excel(
     type_summary_df: pd.DataFrame,
     overall_summary: dict,
@@ -822,6 +952,12 @@ with tab1:
     # ===== Upload =====
     uploaded_file = st.file_uploader("Upload raw data (.xlsx)", type=["xlsx"])
     special_rule_file = st.file_uploader("Upload special date rule (.xlsx)", type=["xlsx"])
+    exception_file_out = st.file_uploader(
+        "Upload Exception Orders (.xlsx) — 選填",
+        type=["xlsx"],
+        key="outbound_exception",
+        help="檔案需含『Order』欄（會比對 DocNo）。命中的訂單會從 KPI/Failed 計算中排除，但會單獨統計筆數。",
+    )
 
     if uploaded_file is not None:
 
@@ -834,9 +970,40 @@ with tab1:
             special_df = load_special_rules(special_rule_file)
             special_rule_dict = build_special_rule_dict(special_df)
 
+        exception_orders_out = (
+            load_exception_orders(exception_file_out) if exception_file_out is not None else set()
+        )
+
         # ===== Prepare KPI =====
-        df = prepare_data(raw_df, special_rule_dict)
+        df_all = prepare_data(raw_df, special_rule_dict)
+
+        if exception_orders_out:
+            df_all["Is Exception"] = (
+                df_all["DocNo"].astype(str).str.strip().str.upper().isin(exception_orders_out)
+            )
+        else:
+            df_all["Is Exception"] = False
+
+        excluded_total_out = int(df_all["Is Exception"].sum())
+
+        df = df_all[~df_all["Is Exception"]].copy()
         summary_df = build_daily_kpi_summary(df)
+
+        excluded_per_day = pd.DataFrame(columns=["Report Date", "excluded"])
+        if excluded_total_out > 0:
+            excl_src = df_all[df_all["Is Exception"]].copy()
+            excl_src["Report Date"] = pd.to_datetime(excl_src["Committed Date"], errors="coerce").dt.date
+            excluded_per_day = (
+                excl_src.dropna(subset=["Report Date"])
+                .groupby("Report Date").size().reset_index(name="excluded")
+            )
+
+        if not summary_df.empty or not excluded_per_day.empty:
+            summary_df = pd.merge(summary_df, excluded_per_day, on="Report Date", how="outer").fillna(0)
+            if "excluded" not in summary_df.columns:
+                summary_df["excluded"] = 0
+            summary_df["Report Date"] = pd.to_datetime(summary_df["Report Date"]).dt.date
+            summary_df = summary_df.sort_values("Report Date").reset_index(drop=True)
 
         # ===== 日期篩選 =====
         if not summary_df.empty:
@@ -870,11 +1037,13 @@ with tab1:
             filtered_df = df.copy()
 
         # ===== KPI 指標 =====
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4, col5 = st.columns(5)
         col1.metric("Total Rows", f"{len(filtered_df):,}")
         col2.metric("Complete", f"{(filtered_df['Status Group'] == 'Complete').sum():,}")
         col3.metric("PGI", f"{(filtered_df['Status Group'] == 'PGI').sum():,}")
         col4.metric("Void", f"{(filtered_df['Status Group'] == 'Void').sum():,}")
+        col5.metric("Excluded (Exception)", f"{excluded_total_out:,}",
+                    help="由 Exception 檔指定排除、不納入 KPI 計算的訂單筆數。")
 
         # ===== 圖表 =====
         st.subheader("Outbound KPI Chart")
@@ -882,19 +1051,42 @@ with tab1:
         st.plotly_chart(fig_kpi, width="stretch")
 
         # ===== Summary =====
-        display_summary_df = filtered_summary_df.rename(columns={
+        rename_map = {
             "Report Date": "Date",
             "total_945": "945",
             "need_fulfill": "Need Fulfill",
             "in_kpi": "In KPI",
             "failed": "Failed",
-            "kpi_rate": "KPI Rate"
-        })
+            "kpi_rate": "KPI Rate",
+            "excluded": "Excluded",
+        }
+        display_summary_df = filtered_summary_df.rename(columns=rename_map)
 
-        display_summary_df["KPI Rate"] = display_summary_df["KPI Rate"].map(lambda x: f"{x:.2%}")
+        if "KPI Rate" in display_summary_df.columns:
+            display_summary_df["KPI Rate"] = display_summary_df["KPI Rate"].map(lambda x: f"{x:.2%}")
+        if "Excluded" in display_summary_df.columns:
+            display_summary_df["Excluded"] = display_summary_df["Excluded"].astype(int)
+
+        preferred_order = ["Date", "945", "Need Fulfill", "In KPI", "Failed", "Excluded", "KPI Rate"]
+        ordered_cols = [c for c in preferred_order if c in display_summary_df.columns] + [
+            c for c in display_summary_df.columns if c not in preferred_order
+        ]
+        display_summary_df = display_summary_df[ordered_cols]
 
         st.subheader("Daily KPI Summary")
         st.dataframe(display_summary_df, width="stretch")
+
+        if excluded_total_out > 0:
+            st.subheader("Excluded Orders (Exception)")
+            excl_view = df_all[df_all["Is Exception"]].copy()
+            for c in ["Committed Date", "Created Date"]:
+                if c in excl_view.columns:
+                    excl_view[c] = pd.to_datetime(excl_view[c], errors="coerce").dt.date
+            keep_cols = [c for c in ["DocNo", "TransNo", "Country code", "TransStatus",
+                                     "Created Date", "Committed Date", "Status Group"]
+                         if c in excl_view.columns]
+            st.write(f"共 **{excluded_total_out:,}** 筆訂單被排除（不納入 KPI 計算）")
+            st.dataframe(excl_view[keep_cols] if keep_cols else excl_view, width="stretch")
 
         # ===== 明細 =====
         st.subheader("Processed Data Preview")
@@ -929,17 +1121,40 @@ with tab2:
         key="inbound_mapping"
     )
 
+    exception_file_in = st.file_uploader(
+        "Upload Exception Orders (.xlsx) — 選填",
+        type=["xlsx"],
+        key="inbound_exception",
+        help="檔案需含『Order』欄（會比對 INBSHIP No.）。命中的訂單會從 KPI/Failed 計算中排除，但會單獨統計筆數。",
+    )
+
     if inbound_raw_file is not None and inbound_mapping_file is not None:
 
         # ===== Load Data =====
         raw_df = load_inbound_raw(inbound_raw_file)
         mapping_df = load_inbound_mapping(inbound_mapping_file)
 
+        exception_orders_in = (
+            load_exception_orders(exception_file_in) if exception_file_in is not None else set()
+        )
+
         # ===== Prepare Data =====
         inbound_df = prepare_inbound_data(raw_df, mapping_df)
 
+        if exception_orders_in and "INBSHIP No." in inbound_df.columns:
+            inbound_df["Is Exception"] = (
+                inbound_df["INBSHIP No."].astype(str).str.strip().str.upper().isin(exception_orders_in)
+            )
+        else:
+            inbound_df["Is Exception"] = False
+
+        excluded_total_in = int(inbound_df["Is Exception"].sum())
+        inbound_df_all = inbound_df.copy()
+        inbound_df = inbound_df[~inbound_df["Is Exception"]].copy()
+
         # ===== 日期篩選 =====
         inbound_df["Actual Date"] = pd.to_datetime(inbound_df["Date"], errors="coerce")
+        inbound_df_all["Actual Date"] = pd.to_datetime(inbound_df_all["Date"], errors="coerce")
 
         if not inbound_df["Actual Date"].dropna().empty:
             min_date = inbound_df["Actual Date"].min().date()
@@ -960,10 +1175,19 @@ with tab2:
                     (inbound_df["Actual Date"].dt.date >= start_date) &
                     (inbound_df["Actual Date"].dt.date <= end_date)
                 ].copy()
+                filtered_inbound_all_df = inbound_df_all[
+                    (inbound_df_all["Actual Date"].dt.date >= start_date) &
+                    (inbound_df_all["Actual Date"].dt.date <= end_date)
+                ].copy()
             else:
                 filtered_inbound_df = inbound_df.copy()
+                filtered_inbound_all_df = inbound_df_all.copy()
         else:
             filtered_inbound_df = inbound_df.copy()
+            filtered_inbound_all_df = inbound_df_all.copy()
+
+        excluded_inbound_df = filtered_inbound_all_df[filtered_inbound_all_df["Is Exception"]].copy()
+        excluded_total_in_filtered = len(excluded_inbound_df)
 
         # ===== KPI Summary =====
         inbound_summary_df = build_inbound_kpi_summary(filtered_inbound_df)
@@ -994,11 +1218,13 @@ with tab2:
             )
 
         # ===== KPI 指標 =====
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4, col5 = st.columns(5)
         col1.metric("Total Rows", f"{len(filtered_inbound_df):,}")
         col2.metric("Matched", f"{(filtered_inbound_df['Mapping Status'] == 'Matched').sum():,}")
         col3.metric("Need Confirm", f"{(filtered_inbound_df['Mapping Status'] == '確認報單號碼').sum():,}")
         col4.metric("Failed", f"{(filtered_inbound_df['KPI Result'] == 'Failed').sum():,}")
+        col5.metric("Excluded (Exception)", f"{excluded_total_in_filtered:,}",
+                    help="由 Exception 檔指定排除、不納入 KPI 計算的進貨筆數。")
 
         # ===== KPI Chart =====
         st.subheader("Inbound KPI Chart")
@@ -1012,17 +1238,54 @@ with tab2:
         st.subheader("Inbound KPI Summary")
         if not inbound_summary_df.empty:
             display_inbound_summary_df = inbound_summary_df.copy()
-            display_inbound_summary_df["kpi_rate"] = display_inbound_summary_df["kpi_rate"].map(lambda x: f"{x:.2%}")
+
+            if not excluded_inbound_df.empty:
+                excl_by_date = (
+                    excluded_inbound_df.dropna(subset=["Actual Date"])
+                    .assign(_d=lambda d: d["Actual Date"].dt.date)
+                    .groupby("_d").size().reset_index(name="excluded")
+                    .rename(columns={"_d": "Report Date"})
+                )
+                display_inbound_summary_df = pd.merge(
+                    display_inbound_summary_df, excl_by_date,
+                    on="Report Date", how="outer"
+                ).fillna(0)
+            else:
+                display_inbound_summary_df["excluded"] = 0
+
+            display_inbound_summary_df["kpi_rate"] = display_inbound_summary_df["kpi_rate"].map(
+                lambda x: f"{x:.2%}" if pd.notna(x) and not isinstance(x, str) else x
+            )
             display_inbound_summary_df = display_inbound_summary_df.rename(columns={
                 "Report Date": "Date",
                 "in_kpi": "In KPI",
                 "failed": "Failed",
                 "total": "Total",
-                "kpi_rate": "KPI Rate"
+                "kpi_rate": "KPI Rate",
+                "excluded": "Excluded",
             })
+            if "Excluded" in display_inbound_summary_df.columns:
+                display_inbound_summary_df["Excluded"] = display_inbound_summary_df["Excluded"].astype(int)
+            preferred_order = ["Date", "In KPI", "Failed", "Total", "Excluded", "KPI Rate"]
+            ordered_cols = [c for c in preferred_order if c in display_inbound_summary_df.columns] + [
+                c for c in display_inbound_summary_df.columns if c not in preferred_order
+            ]
+            display_inbound_summary_df = display_inbound_summary_df[ordered_cols].sort_values("Date")
             st.dataframe(display_inbound_summary_df, width="stretch")
         else:
             st.info("No summary data available for the selected date range.")
+
+        if excluded_total_in_filtered > 0:
+            st.subheader("Excluded Inbound Orders (Exception)")
+            excl_view = excluded_inbound_df.copy()
+            for c in ["Date", "Mapped Inbound Date", "Need Fulfill Date"]:
+                if c in excl_view.columns:
+                    excl_view[c] = pd.to_datetime(excl_view[c], errors="coerce").dt.date
+            keep_cols = [c for c in ["Vendor", "Mapped Inbound Date", "Date",
+                                     "INBSHIP No.", "Declaration#", "PCS QTY"]
+                         if c in excl_view.columns]
+            st.write(f"共 **{excluded_total_in_filtered:,}** 筆進貨被排除（不納入 KPI 計算）")
+            st.dataframe(excl_view[keep_cols] if keep_cols else excl_view, width="stretch")
 
         # ===== Failed List =====
         st.subheader("Failed Item List")
@@ -1062,10 +1325,15 @@ with tab3:
         key="storage_master",
     )
 
-    storage_usage_file = st.file_uploader(
-        "Upload Storage Usage Report (實際庫存報表 .xlsx)",
+    storage_usage_files = st.file_uploader(
+        "Upload Storage Usage Reports (實際庫存報表 .xlsx，可一次上傳多週)",
         type=["xlsx"],
         key="storage_usage",
+        accept_multiple_files=True,
+        help=(
+            "可一次上傳多個檔案；系統會從檔名（例如 CR_WMSv3_Framework_Storage_Usage_Report_2026-05-20.xlsx）"
+            "解析日期並轉成年度週數。同一週若有多個檔案，將以日期最晚的那筆為準。"
+        ),
     )
 
     item_master_file = st.file_uploader(
@@ -1085,11 +1353,29 @@ with tab3:
         key="dl_item_master_template",
     )
 
-    if storage_master_file is not None and storage_usage_file is not None:
+    if storage_master_file is not None and storage_usage_files:
 
-        # ===== Load =====
+        # ===== Load Master =====
         master_df = load_storage_master(storage_master_file)
-        usage_df = load_storage_usage(storage_usage_file)
+
+        # ===== 解析每個 usage 檔案的日期 / 週數 =====
+        parsed_files = []
+        files_without_date = []
+        for f in storage_usage_files:
+            d = parse_date_from_filename(getattr(f, "name", ""))
+            if d is None:
+                files_without_date.append(getattr(f, "name", "(unknown)"))
+            else:
+                parsed_files.append((f, d))
+
+        if files_without_date:
+            st.warning(
+                "以下檔名無法解析日期，將被略過：\n- "
+                + "\n- ".join(files_without_date)
+                + "\n請確保檔名包含 YYYY-MM-DD 格式（例如 ..._2026-05-20.xlsx）。"
+            )
+
+        weekly_files = dedup_files_by_week(parsed_files)
 
         # 讀 Item Master（選填）
         if item_master_file is not None:
@@ -1102,8 +1388,13 @@ with tab3:
         else:
             item_master_dict = {}
 
+        latest_entry = weekly_files[-1] if weekly_files else None
+        usage_df = load_storage_usage(latest_entry["file"]) if latest_entry is not None else pd.DataFrame()
+
         if master_df.empty:
             st.error("無法從儲位總表讀到 Location/Type 欄位，請確認檔案格式。")
+        elif not weekly_files:
+            st.error("沒有任何 Storage Usage 檔案可分析，請確認檔名包含日期。")
         elif usage_df.empty:
             st.error("無法從實際庫存報表讀到 LocationCode 欄位，請確認檔案格式。")
         else:
@@ -1127,12 +1418,150 @@ with tab3:
                 usage_df["Item Type"] = "Unknown"
                 st.warning("實際庫存報表中找不到 itemcode 欄位，無法依 Item Type 進一步分類。")
 
+            # ===== Item Type 多選器（連動整個 tab3）=====
+            st.markdown("### 觀察範圍篩選")
+            usage_item_types_all = sorted(usage_df["Item Type"].dropna().unique())
+            selected_item_types = st.multiselect(
+                "選擇要分析的 Item Type (可複選；不選代表「全部」)",
+                options=usage_item_types_all,
+                default=usage_item_types_all,
+                key="storage_item_type_multiselect",
+                help="可選一或多個 Item Type；下方『每週變化量』與『依 Item Type 觀察』兩個區塊都會跟著連動。不選任何項目時，預設視為全部。",
+            )
+
+            if not selected_item_types:
+                effective_item_types = usage_item_types_all
+                is_full_scope = True
+            else:
+                effective_item_types = selected_item_types
+                is_full_scope = set(selected_item_types) == set(usage_item_types_all)
+
+            if is_full_scope:
+                scope_label = "全部 (All Item Types)"
+            elif len(effective_item_types) == 1:
+                scope_label = f"Item Type = {effective_item_types[0]}"
+            else:
+                preview = ", ".join(effective_item_types[:3])
+                tail = " ..." if len(effective_item_types) > 3 else ""
+                scope_label = f"Item Type ({len(effective_item_types)} 種): {preview}{tail}"
+
+            if is_full_scope:
+                filtered_usage_df = usage_df.copy()
+            else:
+                filtered_usage_df = usage_df[usage_df["Item Type"].isin(effective_item_types)].copy()
+
+            st.caption(f"目前 scope：**{scope_label}** ｜ 對應 itemcode 列數: {len(filtered_usage_df):,}")
+            st.markdown("---")
+
+            # ===== 每週變化趨勢 (跨週) =====
+            st.markdown("### 每週變化量 (Weekly Trend)")
+            weekly_info_rows = [
+                {
+                    "Year Week": w["week_label"],
+                    "File Date": w["date"].strftime("%Y-%m-%d"),
+                    "File Name": getattr(w["file"], "name", ""),
+                }
+                for w in weekly_files
+            ]
+            st.caption(
+                f"共偵測到 **{len(weekly_files):,}** 週資料（同週多檔僅保留最晚日期）。"
+                f"最新一週：**{weekly_files[-1]['week_label']}**（檔案日期 {weekly_files[-1]['date']:%Y-%m-%d}）。"
+                f" 目前 Item Type scope：{scope_label}"
+            )
+            st.dataframe(pd.DataFrame(weekly_info_rows), width="stretch")
+
+            available_types = list(STORAGE_TYPES) + sorted(set(master_df["Type"].unique()) - set(STORAGE_TYPES))
+            selected_storage_types = st.multiselect(
+                "選擇要觀察的儲位類型 (可複選)",
+                options=available_types,
+                default=list(STORAGE_TYPES),
+                key="weekly_storage_type_multiselect",
+                help="可選擇單一或多種儲位類型；圖表會即時連動，副座標的『合計使用率』也會依所選類型重新計算。",
+            )
+
+            if not selected_storage_types:
+                st.info("請至少選擇一個儲位類型來顯示趨勢圖。")
+                weekly_trend_df = pd.DataFrame(
+                    columns=["Week Label", "Date", "Type", "Total", "Used", "Empty", "Utilization"]
+                )
+            else:
+                weekly_rows = []
+                for entry in weekly_files:
+                    wk_usage_df = load_storage_usage(entry["file"]).copy()
+                    if "itemcode" in wk_usage_df.columns and item_master_dict:
+                        wk_usage_df["Item Type"] = wk_usage_df["itemcode"].apply(
+                            lambda x: get_item_type(x, item_master_dict)
+                        )
+                    else:
+                        wk_usage_df["Item Type"] = "Unknown"
+
+                    if not is_full_scope:
+                        wk_usage_df = wk_usage_df[wk_usage_df["Item Type"].isin(effective_item_types)]
+
+                    wk_summary_df, _ovw, _unm, _used = build_utilization_summary(master_df, wk_usage_df)
+                    for _, row in wk_summary_df.iterrows():
+                        weekly_rows.append({
+                            "Week Label": entry["week_label"],
+                            "Date": entry["date"],
+                            "Type": row["Type"],
+                            "Total": int(row["Total"]),
+                            "Used": int(row["Used"]),
+                            "Empty": int(row["Empty"]),
+                            "Utilization": float(row["Utilization"]),
+                        })
+                weekly_trend_df = pd.DataFrame(weekly_rows)
+
+                fig_weekly = build_weekly_trend_chart(weekly_trend_df, selected_storage_types)
+                st.plotly_chart(fig_weekly, width="stretch")
+
+                if not weekly_trend_df.empty:
+                    pivot_used = (
+                        weekly_trend_df[weekly_trend_df["Type"].isin(selected_storage_types)]
+                        .pivot_table(index="Week Label", columns="Type", values="Used", aggfunc="sum")
+                        .fillna(0).astype(int)
+                    )
+                    week_order = (
+                        weekly_trend_df[["Week Label", "Date"]]
+                        .drop_duplicates().sort_values("Date")["Week Label"].tolist()
+                    )
+                    pivot_used = pivot_used.reindex(week_order)
+
+                    rate_per_week = []
+                    for wk in week_order:
+                        wk_sub = weekly_trend_df[
+                            (weekly_trend_df["Week Label"] == wk)
+                            & (weekly_trend_df["Type"].isin(selected_storage_types))
+                        ]
+                        total = wk_sub["Total"].sum()
+                        used = wk_sub["Used"].sum()
+                        rate_per_week.append(used / total if total > 0 else 0.0)
+                    pivot_used["Total Used"] = pivot_used.sum(axis=1)
+                    pivot_used["Utilization"] = rate_per_week
+
+                    diff = pivot_used[["Total Used"]].diff().rename(columns={"Total Used": "WoW Δ Used"})
+                    util_diff = pivot_used[["Utilization"]].diff().rename(columns={"Utilization": "WoW Δ Util"})
+                    summary_table = pivot_used.join(diff).join(util_diff)
+
+                    display_table = summary_table.copy()
+                    display_table["Utilization"] = display_table["Utilization"].map(lambda x: f"{x:.2%}")
+                    display_table["WoW Δ Util"] = display_table["WoW Δ Util"].map(
+                        lambda x: "" if pd.isna(x) else f"{x:+.2%}"
+                    )
+                    display_table["WoW Δ Used"] = display_table["WoW Δ Used"].map(
+                        lambda x: "" if pd.isna(x) else f"{int(x):+d}"
+                    )
+
+                    st.markdown("#### 每週各類型 Used 數量與週對週變化")
+                    st.dataframe(display_table, width="stretch")
+
+            st.markdown("---")
+
             # ===== 總體 (不分 Item Type) 使用率：作為「總攬」 =====
             type_summary_all_df, overall_summary_all, unmatched_df, used_locations_all = (
                 build_utilization_summary(master_df, usage_df)
             )
 
-            st.markdown("### 總攬 (All Item Types)")
+            st.markdown(f"### 總攬 (All Item Types) — 最新週: {weekly_files[-1]['week_label']}")
 
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("總儲位數", f"{overall_summary_all['total']:,}")
@@ -1194,34 +1623,18 @@ with tab3:
             else:
                 st.info("沒有可顯示的 Item Type × Location Type 資料。")
 
-            # ===== Item Type 篩選器 =====
+            # ===== 依 Item Type 觀察（使用上方多選器的選擇）=====
             st.markdown("---")
             st.markdown("### 依 Item Type 觀察")
 
-            # 收集出現過的 Item Types：以 usage 中真正出現的優先，加上 master 中已知的
-            usage_item_types = sorted(usage_df["Item Type"].dropna().unique())
-            item_type_options = ["全部 (All)"] + usage_item_types
-
-            selected_item_type = st.selectbox(
-                "選擇要分析的 Item Type",
-                options=item_type_options,
-                index=0,
-                key="storage_item_type_filter",
-                help="選『全部 (All)』可查看跨所有 Item Type 的使用率；選擇單一 Item Type 可看該品項在各 Location Type 的儲位佔用率。",
-            )
-
-            if selected_item_type == "全部 (All)":
-                filtered_usage_df = usage_df
+            if is_full_scope:
                 type_summary_df = type_summary_all_df
                 overall_summary = overall_summary_all
                 used_locations = used_locations_all
-                scope_label = "全部 (All Item Types)"
             else:
-                filtered_usage_df = usage_df[usage_df["Item Type"] == selected_item_type].copy()
                 type_summary_df, overall_summary, _unmatched_ignore, used_locations = (
                     build_utilization_summary(master_df, filtered_usage_df)
                 )
-                scope_label = f"Item Type = {selected_item_type}"
 
             st.markdown(f"**Scope**: {scope_label} ｜ 對應 itemcode 列數: {len(filtered_usage_df):,}")
 
@@ -1316,10 +1729,12 @@ with tab3:
                 empty_detail_df=empty_detail_df,
                 unmatched_df=unmatched_df,
             )
-            file_name_scope = (
-                "all" if selected_item_type == "全部 (All)"
-                else selected_item_type.lower().replace(" ", "_")
-            )
+            if is_full_scope:
+                file_name_scope = "all"
+            elif len(effective_item_types) == 1:
+                file_name_scope = effective_item_types[0].lower().replace(" ", "_")
+            else:
+                file_name_scope = f"{len(effective_item_types)}_types"
             st.download_button(
                 label=f"Download Utilization Report ({scope_label}) (.xlsx)",
                 data=excel_bytes,
@@ -1328,4 +1743,4 @@ with tab3:
             )
 
     else:
-        st.info("請同時上傳「儲位總表」與「實際庫存報表」以開始計算。")
+        st.info("請同時上傳「儲位總表」與一個（或多個）「實際庫存報表」以開始計算。")
