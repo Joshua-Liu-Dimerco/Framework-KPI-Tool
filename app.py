@@ -862,7 +862,11 @@ def build_utilization_chart(type_summary_df: pd.DataFrame):
 
 
 def build_weekly_trend_chart(weekly_df, selected_types):
-    """每週變化趨勢圖。主軸: 各 Storage Type 的 Used 疊加柱；副軸: 合計使用率折線。"""
+    """每週變化趨勢圖（總使用率版）。
+
+    需求：不依儲位類型分色，每週只顯示一支堆疊柱
+    (Used + Empty = 總儲位)，柱子內以白色粗體顯示使用率，
+    視覺上更清楚。"""
     fig = go.Figure()
     if weekly_df is None or weekly_df.empty:
         fig.update_layout(title="Weekly Storage Utilization Trend (尚無資料)")
@@ -873,45 +877,98 @@ def build_weekly_trend_chart(weekly_df, selected_types):
         .drop_duplicates().sort_values("Date")["Week Label"].tolist()
     )
 
-    types_to_plot = [t for t in selected_types if t in weekly_df["Type"].unique()]
-    if not types_to_plot:
-        types_to_plot = sorted(weekly_df["Type"].unique())
+    # 仍尊重使用者勾選的儲位類型，但加總成單一數值
+    types_to_include = [t for t in (selected_types or []) if t in weekly_df["Type"].unique()]
+    if not types_to_include:
+        types_to_include = sorted(weekly_df["Type"].unique())
 
-    palette = {"RCK": "#1f77b4", "LAR": "#2ca02c", "SHF": "#9467bd", "MED": "#17becf"}
-
-    for t in types_to_plot:
-        sub = weekly_df[weekly_df["Type"] == t].set_index("Week Label").reindex(week_order)
-        fig.add_trace(go.Bar(
-            x=week_order,
-            y=sub["Used"].fillna(0).astype(int),
-            name=f"{t} Used",
-            marker_color=palette.get(t),
-        ))
-
-    rate_rows = []
+    # 每週彙總成單一筆：Total / Used / Empty / Utilization
+    agg_rows = []
     for wk in week_order:
-        wk_sub = weekly_df[(weekly_df["Week Label"] == wk) & (weekly_df["Type"].isin(types_to_plot))]
-        total = wk_sub["Total"].sum()
-        used = wk_sub["Used"].sum()
-        rate_rows.append({"Week Label": wk, "Utilization": (used / total) if total > 0 else 0.0})
-    rate_df = pd.DataFrame(rate_rows)
+        wk_sub = weekly_df[
+            (weekly_df["Week Label"] == wk)
+            & (weekly_df["Type"].isin(types_to_include))
+        ]
+        total = int(wk_sub["Total"].sum())
+        used = int(wk_sub["Used"].sum())
+        empty = max(total - used, 0)
+        rate = (used / total) if total > 0 else 0.0
+        agg_rows.append({
+            "Week Label": wk,
+            "Total": total,
+            "Used": used,
+            "Empty": empty,
+            "Utilization": rate,
+        })
+    agg_df = pd.DataFrame(agg_rows)
 
+    # Used 柱：在柱子內用白色粗體顯示「Used: 979 / 75.19%」
+    fig.add_trace(go.Bar(
+        x=agg_df["Week Label"],
+        y=agg_df["Used"],
+        name="Used",
+        marker_color="#1f77b4",
+        text=[
+            f"Used: {u:,}<br><b>{r:.2%}</b>"
+            for u, r in zip(agg_df["Used"], agg_df["Utilization"])
+        ],
+        textposition="inside",
+        insidetextanchor="middle",
+        textfont=dict(color="white", size=16, family="Arial Black"),
+        hovertemplate=(
+            "Week: %{x}<br>Used: %{y:,}"
+            "<br>Total: %{customdata[0]:,}"
+            "<br>Utilization: %{customdata[1]:.2%}<extra></extra>"
+        ),
+        customdata=list(zip(agg_df["Total"], agg_df["Utilization"])),
+    ))
+
+    # Empty 柱：補滿到總儲位高度（淺灰色）
+    fig.add_trace(go.Bar(
+        x=agg_df["Week Label"],
+        y=agg_df["Empty"],
+        name="Empty",
+        marker_color="#d3d3d3",
+        text=[f"Empty: {v:,}" for v in agg_df["Empty"]],
+        textposition="inside",
+        insidetextanchor="middle",
+        textfont=dict(color="#333", size=12),
+        hovertemplate=(
+            "Week: %{x}<br>Empty: %{y:,}"
+            "<br>Total: %{customdata[0]:,}<extra></extra>"
+        ),
+        customdata=list(zip(agg_df["Total"])),
+    ))
+
+    # 副軸：使用率折線（不放文字，避免和柱子內白字重疊）
     fig.add_trace(go.Scatter(
-        x=rate_df["Week Label"], y=rate_df["Utilization"],
-        name="Utilization", mode="lines+markers+text",
-        text=[f"{v:.1%}" for v in rate_df["Utilization"]],
-        textposition="top center", yaxis="y2",
+        x=agg_df["Week Label"],
+        y=agg_df["Utilization"],
+        name="Utilization",
+        mode="lines+markers",
+        yaxis="y2",
         line=dict(color="#ff7f0e", width=3),
+        marker=dict(size=10, color="#ff7f0e"),
+        hovertemplate="Week: %{x}<br>Utilization: %{y:.2%}<extra></extra>",
     ))
 
     fig.update_layout(
-        title="Weekly Storage Utilization Trend",
+        title="Weekly Storage Utilization Trend (Total)",
         barmode="stack",
-        xaxis=dict(title="Year Week", type="category",
-                   categoryorder="array", categoryarray=week_order),
-        yaxis=dict(title="Used Locations"),
-        yaxis2=dict(title="Utilization", overlaying="y", side="right",
-                    tickformat=".0%", range=[0, 1.1]),
+        xaxis=dict(
+            title="Year Week",
+            type="category",
+            categoryorder="array",
+            categoryarray=week_order,
+        ),
+        yaxis=dict(title="Total Locations"),
+        yaxis2=dict(
+            title="Utilization",
+            overlaying="y",
+            side="right",
+            tickformat=".0%",
+            range=[0, 1.1],
+        ),
         legend=dict(orientation="h"),
         height=550,
     )
@@ -945,7 +1002,7 @@ def export_utilization_excel(
 
 st.title("Framework KPI Tool")
 
-tab1, tab2, tab3 = st.tabs(["Outbound KPI", "Inbound KPI", "Warehouse Utilization"])
+tab1, tab2, tab3, tab4 = st.tabs(["Outbound KPI", "Inbound KPI", "Warehouse Utilization", "Email Report"])
 
 with tab1:
 
@@ -1103,6 +1160,29 @@ with tab1:
         # ===== Raw =====
         st.subheader("Raw Data Preview")
         st.dataframe(raw_df, width="stretch")
+
+        # ===== 把 Outbound 結果存進 session_state，供 Email Report 分頁讀取 =====
+        _ob_need_fulfill_total = int(filtered_summary_df["need_fulfill"].sum()) if "need_fulfill" in filtered_summary_df.columns else 0
+        _ob_in_kpi_total = int(filtered_summary_df["in_kpi"].sum()) if "in_kpi" in filtered_summary_df.columns else 0
+        _ob_failed_total = int(filtered_summary_df["failed"].sum()) if "failed" in filtered_summary_df.columns else 0
+        _ob_total_945 = int(filtered_summary_df["total_945"].sum()) if "total_945" in filtered_summary_df.columns else 0
+        _ob_avg_rate = (_ob_in_kpi_total / _ob_need_fulfill_total) if _ob_need_fulfill_total > 0 else 1.0
+        st.session_state["outbound_report"] = {
+            "summary_df": display_summary_df.copy(),
+            "metrics": {
+                "Need to Fulfill": _ob_need_fulfill_total,
+                "In KPI": _ob_in_kpi_total,
+                "Failed": _ob_failed_total,
+                "Excluded": int(excluded_total_out),
+                "Total 945": _ob_total_945,
+                "Avg KPI Rate": f"{_ob_avg_rate:.2%}",
+            },
+            "chart_fig": fig_kpi,
+            "date_range": (
+                str(filtered_summary_df["Report Date"].min()) if not filtered_summary_df.empty else "",
+                str(filtered_summary_df["Report Date"].max()) if not filtered_summary_df.empty else "",
+            ),
+        }
 
     else:
         st.info("Please upload your raw data Excel file to begin.")
@@ -1308,6 +1388,30 @@ with tab2:
 
         st.dataframe(display_df, width="stretch")
 
+        # ===== 把 Inbound 結果存進 session_state，供 Email Report 分頁讀取 =====
+        _inbound_summary_for_email = (
+            display_inbound_summary_df.copy()
+            if ("display_inbound_summary_df" in dir() and isinstance(display_inbound_summary_df, pd.DataFrame))
+            else pd.DataFrame()
+        )
+        _inbound_fig_for_email = fig if ("fig" in dir() and not inbound_summary_df.empty) else None
+        _in_total = int(len(filtered_inbound_df))
+        _in_in_kpi = int((filtered_inbound_df["KPI Result"] == "In KPI").sum())
+        _in_failed = int((filtered_inbound_df["KPI Result"] == "Failed").sum())
+        _in_avg_rate = (_in_in_kpi / (_in_in_kpi + _in_failed)) if (_in_in_kpi + _in_failed) > 0 else 1.0
+        st.session_state["inbound_report"] = {
+            "summary_df": _inbound_summary_for_email,
+            "metrics": {
+                "Total Inbound Shipment": _in_total,
+                "In KPI": _in_in_kpi,
+                "Failed": _in_failed,
+                "Excluded": int(excluded_total_in_filtered),
+                "Avg KPI Rate": f"{_in_avg_rate:.2%}",
+            },
+            "chart_fig": _inbound_fig_for_email,
+            "failed_items_df": failed_items_display_df.copy() if isinstance(failed_items_display_df, pd.DataFrame) else pd.DataFrame(),
+        }
+
     else:
         st.info("Please upload both files.")
 
@@ -1486,17 +1590,28 @@ with tab3:
                 )
             else:
                 weekly_rows = []
+                _weekly_data_raw = []  # 為 Email Report 客製化保留每週「未過濾」的 usage_df
                 for entry in weekly_files:
-                    wk_usage_df = load_storage_usage(entry["file"]).copy()
-                    if "itemcode" in wk_usage_df.columns and item_master_dict:
-                        wk_usage_df["Item Type"] = wk_usage_df["itemcode"].apply(
+                    wk_usage_df_full = load_storage_usage(entry["file"]).copy()
+                    if "itemcode" in wk_usage_df_full.columns and item_master_dict:
+                        wk_usage_df_full["Item Type"] = wk_usage_df_full["itemcode"].apply(
                             lambda x: get_item_type(x, item_master_dict)
                         )
                     else:
-                        wk_usage_df["Item Type"] = "Unknown"
+                        wk_usage_df_full["Item Type"] = "Unknown"
 
+                    # 保留未過濾版本供 tab4 重新計算
+                    _weekly_data_raw.append({
+                        "week_label": entry["week_label"],
+                        "date": entry["date"],
+                        "usage_df": wk_usage_df_full.copy(),
+                    })
+
+                    # 套用目前 scope 過濾
                     if not is_full_scope:
-                        wk_usage_df = wk_usage_df[wk_usage_df["Item Type"].isin(effective_item_types)]
+                        wk_usage_df = wk_usage_df_full[wk_usage_df_full["Item Type"].isin(effective_item_types)]
+                    else:
+                        wk_usage_df = wk_usage_df_full
 
                     wk_summary_df, _ovw, _unm, _used = build_utilization_summary(master_df, wk_usage_df)
                     for _, row in wk_summary_df.iterrows():
@@ -1510,6 +1625,14 @@ with tab3:
                             "Utilization": float(row["Utilization"]),
                         })
                 weekly_trend_df = pd.DataFrame(weekly_rows)
+
+                # 存 raw 資料到 session_state，讓 Email Report 分頁可以重新依 Item Type 計算
+                st.session_state["storage_raw"] = {
+                    "master_df": master_df.copy(),
+                    "all_item_types": list(usage_item_types_all),
+                    "weekly_data": _weekly_data_raw,
+                    "STORAGE_TYPES": list(STORAGE_TYPES),
+                }
 
                 fig_weekly = build_weekly_trend_chart(weekly_trend_df, selected_storage_types)
                 st.plotly_chart(fig_weekly, width="stretch")
@@ -1742,5 +1865,839 @@ with tab3:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
+            # ===== 把 Storage 結果存進 session_state，供 Email Report 分頁讀取 =====
+            _per_type_for_email = type_summary_all_df.copy()
+            if not _per_type_for_email.empty and "Utilization" in _per_type_for_email.columns:
+                _per_type_for_email["Utilization"] = _per_type_for_email["Utilization"].map(
+                    lambda x: f"{x:.2%}" if pd.notna(x) else ""
+                )
+            st.session_state["storage_report"] = {
+                "overall": overall_summary_all,
+                "latest_week": weekly_files[-1]["week_label"],
+                "latest_date": weekly_files[-1]["date"].strftime("%Y-%m-%d"),
+                "per_type_df": _per_type_for_email,
+                "weekly_trend_df": weekly_trend_df.copy() if isinstance(weekly_trend_df, pd.DataFrame) else pd.DataFrame(),
+                "weekly_fig": fig_weekly if "fig_weekly" in dir() else None,
+                "scope_label": scope_label,
+            }
+
     else:
         st.info("請同時上傳「儲位總表」與一個（或多個）「實際庫存報表」以開始計算。")
+# =====================================================================
+#  Email Report Tab
+#  整合三個分頁的 KPI / 圖表為一份可直接在 Outlook 信件內文觀看的報告
+# =====================================================================
+
+import base64 as _b64
+import mimetypes as _mt
+from datetime import datetime as _dt
+from email.mime.multipart import MIMEMultipart as _MIMEMultipart
+from email.mime.text import MIMEText as _MIMEText
+from email.mime.image import MIMEImage as _MIMEImage
+from email.utils import make_msgid as _make_msgid, formatdate as _formatdate
+
+DEFAULT_EMAIL_TO = "joshua_j_liu@dimerco.com"
+DEFAULT_EMAIL_CC = ""
+DEFAULT_EMAIL_SUBJECT = "[Framework] Weekly Outbound / Inbound / Warehouse KPI Report"
+
+# ====== Excel-style 表格樣式 (Outlook Word engine 友善：全 inline styles, table-based) ======
+_TABLE_STYLE = (
+    "border-collapse:collapse;border-spacing:0;"
+    "font-family:'Segoe UI',Arial,Helvetica,sans-serif;font-size:13px;"
+    "width:100%;margin:8px 0 14px;"
+    "border:1px solid #b7c3cf;"
+)
+_TH_STYLE = (
+    "background:#1f4e78;color:#ffffff;padding:8px 10px;"
+    "border:1px solid #1f4e78;text-align:left;font-weight:600;"
+)
+_TD_STYLE = "padding:6px 10px;border:1px solid #d0d7de;color:#1f2937;"
+_TD_NUM_STYLE = _TD_STYLE + "text-align:right;font-variant-numeric:tabular-nums;"
+_ROW_ALT = "#f4f7fb"
+
+
+def _td(value, num=False, bg=None, extra=""):
+    """產生 <td> HTML，支援數字靠右對齊與背景色。"""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        text = ""
+    elif isinstance(value, float):
+        text = f"{value:,.2f}"
+    elif isinstance(value, int):
+        text = f"{value:,}"
+    else:
+        text = str(value)
+    style = _TD_NUM_STYLE if num else _TD_STYLE
+    if bg:
+        style += f"background:{bg};"
+    if extra:
+        style += extra
+    return f'<td style="{style}">{text}</td>'
+
+
+def _excel_table_html(df, max_rows=200, numeric_cols=None):
+    """把 DataFrame 渲染成 Excel 樣式 HTML 表格 (Outlook 相容)。"""
+    if df is None or len(df) == 0:
+        return '<p style="color:#9ca3af;font-style:italic;">（無資料）</p>'
+    df = df.head(max_rows)
+    if numeric_cols is None:
+        numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    cols = [str(c) for c in df.columns]
+    head = "".join(f'<th style="{_TH_STYLE}">{c}</th>' for c in cols)
+    rows_html = []
+    for i, (_, row) in enumerate(df.iterrows()):
+        bg = _ROW_ALT if i % 2 else "#ffffff"
+        cells = "".join(
+            _td(row[c], num=(c in numeric_cols), bg=bg) for c in df.columns
+        )
+        rows_html.append(f"<tr>{cells}</tr>")
+    return (
+        f'<table style="{_TABLE_STYLE}">'
+        f'<thead><tr>{head}</tr></thead>'
+        f'<tbody>{"".join(rows_html)}</tbody>'
+        f"</table>"
+    )
+
+
+def _bar_cell_html(value_pct, color="#1f77b4", width_px=180, label=None):
+    """畫一格內嵌的水平 bar (用 nested table，Outlook 相容)。
+    value_pct 介於 0~1。label 為 bar 內文字。"""
+    try:
+        v = max(0.0, min(1.0, float(value_pct)))
+    except Exception:
+        v = 0.0
+    used_w = int(round(v * width_px))
+    empty_w = max(width_px - used_w, 0)
+    label_html = ""
+    if label:
+        label_html = (
+            f'<span style="position:relative;left:6px;color:#ffffff;'
+            f'font-size:11px;font-weight:bold;">{label}</span>'
+        )
+    return (
+        f'<table style="border-collapse:collapse;border-spacing:0;'
+        f'width:{width_px}px;height:18px;border:1px solid #b7c3cf;background:#eef2f7;">'
+        f'<tr>'
+        f'<td style="width:{used_w}px;height:18px;background:{color};padding:0;line-height:18px;">'
+        f'{label_html}</td>'
+        f'<td style="width:{empty_w}px;height:18px;background:#eef2f7;padding:0;"></td>'
+        f"</tr></table>"
+    )
+
+
+# ====== 三個區塊各自的 HTML 圖表 (純表格，Outlook 相容) ======
+
+def _to_rate_float(v):
+    """把任意輸入 (數字 / 字串 / NaN) 統一轉成 0~1 的使用率 float。
+    支援：1.0 / 0.95 / "100.00%" / "95.50%" / "0.95" / None / NaN
+    回傳介於 0.0 ~ 1.0 (不會超出範圍)。
+    """
+    try:
+        if v is None:
+            return 0.0
+        if isinstance(v, (int, float)):
+            if pd.isna(v):
+                return 0.0
+            f = float(v)
+        else:
+            s = str(v).replace("%", "").replace(",", "").strip()
+            if not s or s.lower() == "nan":
+                return 0.0
+            f = float(s)
+        # 若數值 > 1.0001，視為百分比 (e.g. 95.5 來自 "95.50%")
+        if f > 1.0001:
+            f = f / 100.0
+        # 限制範圍
+        if f < 0:
+            f = 0.0
+        elif f > 1.0:
+            f = 1.0
+        return f
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _to_int_safe(v, default=0):
+    """穩健地把任意輸入轉成 int。"""
+    try:
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return default
+        if isinstance(v, (int, float)):
+            return int(v)
+        s = str(v).replace(",", "").strip()
+        if not s or s.lower() == "nan":
+            return default
+        return int(float(s))
+    except (ValueError, TypeError):
+        return default
+
+
+def _chart_outbound_html(summary_df):
+    """Outbound: 顯示每日 945 / Need Fulfill / In KPI / Failed / KPI Rate
+    以 stacked-bar 風格呈現 (In KPI 藍 + Failed 紅)。"""
+    if summary_df is None or summary_df.empty:
+        return '<p style="color:#9ca3af;font-style:italic;">（無圖表資料）</p>'
+    df = summary_df.copy()
+    # 統一欄名
+    rename = {
+        "Report Date": "Date", "total_945": "945", "need_fulfill": "Need Fulfill",
+        "in_kpi": "In KPI", "failed": "Failed", "kpi_rate": "KPI Rate",
+        "excluded": "Excluded",
+    }
+    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+    if "Date" not in df.columns:
+        return '<p style="color:#9ca3af;font-style:italic;">（無圖表資料）</p>'
+
+    rows_html = []
+    # 用 helper 安全取得每列 Need Fulfill 最大值
+    need_vals = [_to_int_safe(v) for v in df.get("Need Fulfill", pd.Series([1]))]
+    max_need = max(need_vals) if need_vals else 1
+    if max_need <= 0:
+        max_need = 1
+    for i, (_, row) in enumerate(df.iterrows()):
+        bg = _ROW_ALT if i % 2 else "#ffffff"
+        need = _to_int_safe(row.get("Need Fulfill"))
+        in_kpi = _to_int_safe(row.get("In KPI"))
+        failed = _to_int_safe(row.get("Failed"))
+        rate = _to_rate_float(row.get("KPI Rate"))
+        # bar: 整條長度按 need / max_need；內部分 in_kpi / failed
+        bar_total_w = 220
+        bar_w = int(round((need / max_need) * bar_total_w)) if max_need else 0
+        if need > 0:
+            in_w = int(round((in_kpi / need) * bar_w))
+            fail_w = max(bar_w - in_w, 0)
+        else:
+            in_w = fail_w = 0
+        empty_w = max(bar_total_w - bar_w, 0)
+        bar_html = (
+            f'<table style="border-collapse:collapse;border-spacing:0;'
+            f'width:{bar_total_w}px;height:16px;border:1px solid #b7c3cf;background:#eef2f7;">'
+            f'<tr>'
+            f'<td style="width:{in_w}px;height:16px;background:#1f77b4;padding:0;"></td>'
+            f'<td style="width:{fail_w}px;height:16px;background:#d62728;padding:0;"></td>'
+            f'<td style="width:{empty_w}px;height:16px;background:#eef2f7;padding:0;"></td>'
+            f'</tr></table>'
+        )
+        rate_color = "#16a34a" if rate >= 0.95 else ("#eab308" if rate >= 0.85 else "#dc2626")
+        excluded = _to_int_safe(row.get("Excluded"))
+        cells = (
+            _td(row.get("Date"), bg=bg)
+            + _td(row.get("945", 0), num=True, bg=bg)
+            + _td(need, num=True, bg=bg)
+            + _td(in_kpi, num=True, bg=bg)
+            + _td(failed, num=True, bg=bg)
+            + _td(excluded, num=True, bg=bg)
+            + f'<td style="{_TD_NUM_STYLE}background:{bg};color:{rate_color};font-weight:600;">{rate:.2%}</td>'
+            + f'<td style="{_TD_STYLE}background:{bg};">{bar_html}</td>'
+        )
+        rows_html.append(f"<tr>{cells}</tr>")
+    head_cols = ["Date", "945", "Need Fulfill", "In KPI", "Failed", "Excluded", "KPI Rate", "Viz (In KPI / Failed)"]
+    head = "".join(f'<th style="{_TH_STYLE}">{c}</th>' for c in head_cols)
+    legend = (
+        '<div style="font-size:11px;color:#6b7280;margin-bottom:4px;">'
+        '<span style="display:inline-block;width:10px;height:10px;background:#1f77b4;margin-right:4px;"></span>In KPI'
+        '<span style="display:inline-block;width:10px;height:10px;background:#d62728;margin:0 4px 0 12px;"></span>Failed</div>'
+    )
+    return (
+        legend
+        + f'<table style="{_TABLE_STYLE}"><thead><tr>{head}</tr></thead>'
+        + f'<tbody>{"".join(rows_html)}</tbody></table>'
+    )
+
+
+def _chart_inbound_html(summary_df):
+    """Inbound: 顯示每日 In KPI / Failed / Total / KPI Rate 與 stacked bar。"""
+    if summary_df is None or summary_df.empty:
+        return '<p style="color:#9ca3af;font-style:italic;">（無圖表資料）</p>'
+    df = summary_df.copy()
+    rename = {
+        "Report Date": "Date", "in_kpi": "In KPI", "failed": "Failed",
+        "total": "Total", "kpi_rate": "KPI Rate", "excluded": "Excluded",
+    }
+    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+    if "Date" not in df.columns:
+        return '<p style="color:#9ca3af;font-style:italic;">（無圖表資料）</p>'
+
+    rows_html = []
+    total_vals = [_to_int_safe(v) for v in df.get("Total", pd.Series([1]))]
+    max_total = max(total_vals) if total_vals else 1
+    if max_total <= 0:
+        max_total = 1
+    for i, (_, row) in enumerate(df.iterrows()):
+        bg = _ROW_ALT if i % 2 else "#ffffff"
+        total = _to_int_safe(row.get("Total"))
+        in_kpi = _to_int_safe(row.get("In KPI"))
+        failed = _to_int_safe(row.get("Failed"))
+        rate = _to_rate_float(row.get("KPI Rate"))
+        bar_total_w = 220
+        bar_w = int(round((total / max_total) * bar_total_w)) if max_total else 0
+        if total > 0:
+            in_w = int(round((in_kpi / total) * bar_w))
+            fail_w = max(bar_w - in_w, 0)
+        else:
+            in_w = fail_w = 0
+        empty_w = max(bar_total_w - bar_w, 0)
+        bar_html = (
+            f'<table style="border-collapse:collapse;border-spacing:0;'
+            f'width:{bar_total_w}px;height:16px;border:1px solid #b7c3cf;background:#eef2f7;">'
+            f'<tr>'
+            f'<td style="width:{in_w}px;height:16px;background:#1f77b4;padding:0;"></td>'
+            f'<td style="width:{fail_w}px;height:16px;background:#d62728;padding:0;"></td>'
+            f'<td style="width:{empty_w}px;height:16px;background:#eef2f7;padding:0;"></td>'
+            f'</tr></table>'
+        )
+        rate_color = "#16a34a" if rate >= 0.95 else ("#eab308" if rate >= 0.85 else "#dc2626")
+        excluded = _to_int_safe(row.get("Excluded"))
+        cells = (
+            _td(row.get("Date"), bg=bg)
+            + _td(in_kpi, num=True, bg=bg)
+            + _td(failed, num=True, bg=bg)
+            + _td(total, num=True, bg=bg)
+            + _td(excluded, num=True, bg=bg)
+            + f'<td style="{_TD_NUM_STYLE}background:{bg};color:{rate_color};font-weight:600;">{rate:.2%}</td>'
+            + f'<td style="{_TD_STYLE}background:{bg};">{bar_html}</td>'
+        )
+        rows_html.append(f"<tr>{cells}</tr>")
+    head_cols = ["Date", "In KPI", "Failed", "Total", "Excluded", "KPI Rate", "Viz (In KPI / Failed)"]
+    head = "".join(f'<th style="{_TH_STYLE}">{c}</th>' for c in head_cols)
+    legend = (
+        '<div style="font-size:11px;color:#6b7280;margin-bottom:4px;">'
+        '<span style="display:inline-block;width:10px;height:10px;background:#1f77b4;margin-right:4px;"></span>In KPI'
+        '<span style="display:inline-block;width:10px;height:10px;background:#d62728;margin:0 4px 0 12px;"></span>Failed</div>'
+    )
+    return (
+        legend
+        + f'<table style="{_TABLE_STYLE}"><thead><tr>{head}</tr></thead>'
+        + f'<tbody>{"".join(rows_html)}</tbody></table>'
+    )
+
+
+def _chart_storage_weekly_html(weekly_trend_df, selected_types=None):
+    """Storage 累加歷史：每週 Total / Used / Empty / Util% + WoW Δ + stacked bar"""
+    if weekly_trend_df is None or weekly_trend_df.empty:
+        return '<p style="color:#9ca3af;font-style:italic;">（無圖表資料）</p>'
+    df = weekly_trend_df.copy()
+    if selected_types:
+        df = df[df["Type"].isin(selected_types)]
+    # 依週彙總
+    agg = df.groupby(["Week Label", "Date"], as_index=False).agg(
+        Total=("Total", "sum"), Used=("Used", "sum")
+    )
+    agg["Empty"] = agg["Total"] - agg["Used"]
+    agg["Utilization"] = agg.apply(
+        lambda r: (r["Used"] / r["Total"]) if r["Total"] > 0 else 0.0, axis=1
+    )
+    agg = agg.sort_values("Date").reset_index(drop=True)
+    agg["WoW_Used"] = agg["Used"].diff()
+    agg["WoW_Util"] = agg["Utilization"].diff()
+
+    rows_html = []
+    for i, row in agg.iterrows():
+        bg = _ROW_ALT if i % 2 else "#ffffff"
+        total = int(row["Total"])
+        used = int(row["Used"])
+        empty = int(row["Empty"])
+        util = float(row["Utilization"])
+        # bar: Used (藍) + Empty (淺灰)
+        bar_total_w = 240
+        used_w = int(round(util * bar_total_w))
+        empty_w = bar_total_w - used_w
+        bar_html = (
+            f'<table style="border-collapse:collapse;border-spacing:0;'
+            f'width:{bar_total_w}px;height:18px;border:1px solid #b7c3cf;">'
+            f'<tr>'
+            f'<td style="width:{used_w}px;height:18px;background:#1f77b4;padding:0;text-align:center;'
+            f'color:#ffffff;font-weight:700;font-size:11px;line-height:18px;">{util:.2%}</td>'
+            f'<td style="width:{empty_w}px;height:18px;background:#d3d3d3;padding:0;"></td>'
+            f'</tr></table>'
+        )
+        wow_used = row.get("WoW_Used")
+        wow_util = row.get("WoW_Util")
+        wow_used_text = "" if pd.isna(wow_used) else (f"+{int(wow_used):,}" if wow_used >= 0 else f"{int(wow_used):,}")
+        wow_util_text = "" if pd.isna(wow_util) else (f"+{wow_util:.2%}" if wow_util >= 0 else f"{wow_util:.2%}")
+        wow_used_color = "#16a34a" if (not pd.isna(wow_used) and wow_used >= 0) else "#dc2626"
+        wow_util_color = "#16a34a" if (not pd.isna(wow_util) and wow_util >= 0) else "#dc2626"
+        cells = (
+            _td(row["Week Label"], bg=bg)
+            + _td(total, num=True, bg=bg)
+            + _td(used, num=True, bg=bg)
+            + _td(empty, num=True, bg=bg)
+            + f'<td style="{_TD_NUM_STYLE}background:{bg};font-weight:600;">{util:.2%}</td>'
+            + f'<td style="{_TD_NUM_STYLE}background:{bg};color:{wow_used_color};">{wow_used_text}</td>'
+            + f'<td style="{_TD_NUM_STYLE}background:{bg};color:{wow_util_color};">{wow_util_text}</td>'
+            + f'<td style="{_TD_STYLE}background:{bg};">{bar_html}</td>'
+        )
+        rows_html.append(f"<tr>{cells}</tr>")
+
+    head_cols = ["Year Week", "Total", "Used", "Empty", "Util%", "WoW Δ Used", "WoW Δ Util%", "視覺化 Utilization"]
+    head = "".join(f'<th style="{_TH_STYLE}">{c}</th>' for c in head_cols)
+    legend = (
+        '<div style="font-size:11px;color:#6b7280;margin-bottom:4px;">'
+        '<span style="display:inline-block;width:10px;height:10px;background:#1f77b4;margin-right:4px;"></span>Used'
+        '<span style="display:inline-block;width:10px;height:10px;background:#d3d3d3;margin:0 4px 0 12px;"></span>Empty</div>'
+    )
+    return (
+        legend
+        + f'<table style="{_TABLE_STYLE}"><thead><tr>{head}</tr></thead>'
+        + f'<tbody>{"".join(rows_html)}</tbody></table>'
+    )
+
+
+def _chart_storage_by_type_html(weekly_trend_df, selected_types=None):
+    """每個 Storage Type 各週 Util% 變化 + 最新一週的 WoW Δ Used / Δ Util%。"""
+    if weekly_trend_df is None or weekly_trend_df.empty:
+        return '<p style="color:#9ca3af;font-style:italic;">（無歷史資料）</p>'
+    df = weekly_trend_df.copy()
+    if selected_types:
+        df = df[df["Type"].isin(selected_types)]
+    if df.empty:
+        return '<p style="color:#9ca3af;font-style:italic;">（無歷史資料）</p>'
+    week_order = (
+        df[["Week Label", "Date"]].drop_duplicates().sort_values("Date")["Week Label"].tolist()
+    )
+    pivot_util = (
+        df.pivot_table(index="Type", columns="Week Label", values="Utilization", aggfunc="mean")
+        .reindex(columns=week_order)
+        .fillna(0)
+    )
+    pivot_used = (
+        df.pivot_table(index="Type", columns="Week Label", values="Used", aggfunc="sum")
+        .reindex(columns=week_order)
+        .fillna(0)
+        .astype(int)
+    )
+    has_wow = len(week_order) >= 2
+    head_cols = ["Type"] + list(pivot_util.columns)
+    if has_wow:
+        head_cols += ["WoW Δ Used", "WoW Δ Util%"]
+    head_cols += ["Latest Week"]
+    head = "".join(f'<th style="{_TH_STYLE}">{c}</th>' for c in head_cols)
+    rows_html = []
+    for i, typ in enumerate(pivot_util.index):
+        bg = _ROW_ALT if i % 2 else "#ffffff"
+        srow_util = pivot_util.loc[typ]
+        srow_used = pivot_used.loc[typ]
+        cells = _td(typ, bg=bg)
+        for c in pivot_util.columns:
+            v = float(srow_util[c])
+            cells += f'<td style="{_TD_NUM_STYLE}background:{bg};">{v:.2%}</td>'
+        if has_wow:
+            wow_used = int(srow_used.iloc[-1]) - int(srow_used.iloc[-2])
+            wow_util = float(srow_util.iloc[-1]) - float(srow_util.iloc[-2])
+            used_color = "#16a34a" if wow_used >= 0 else "#dc2626"
+            util_color = "#16a34a" if wow_util >= 0 else "#dc2626"
+            cells += f'<td style="{_TD_NUM_STYLE}background:{bg};color:{used_color};">{wow_used:+,}</td>'
+            cells += f'<td style="{_TD_NUM_STYLE}background:{bg};color:{util_color};">{wow_util:+.2%}</td>'
+        latest_v = float(srow_util.iloc[-1]) if len(srow_util) else 0.0
+        cells += f'<td style="{_TD_STYLE}background:{bg};">{_bar_cell_html(latest_v, color="#1f77b4", width_px=160, label=f"{latest_v:.1%}")}</td>'
+        rows_html.append(f"<tr>{cells}</tr>")
+    return (
+        f'<table style="{_TABLE_STYLE}">'
+        f'<thead><tr>{head}</tr></thead>'
+        f'<tbody>{"".join(rows_html)}</tbody>'
+        f"</table>"
+    )
+
+
+def _compute_storage_trend(storage_raw, selected_item_types=None):
+    """從 storage_raw (master_df + 每週原始 usage_df) 重新計算指定 Item Type 子集的 storage trend。
+
+    參數:
+      selected_item_types: None 表示「全部 Item Types」；list 則只取對應 Item Type 的列。
+
+    回傳 dict 包含 overall / weekly_trend_df / per_type_df / latest_week / latest_date。
+    """
+    if not storage_raw:
+        return None
+    master_df = storage_raw.get("master_df")
+    weekly_data = storage_raw.get("weekly_data", [])
+    if master_df is None or not weekly_data:
+        return None
+
+    weekly_rows = []
+    latest_overall = None
+    latest_per_type_df = None
+    for entry in weekly_data:
+        usage_df = entry["usage_df"]
+        if selected_item_types is not None:
+            usage_df = usage_df[usage_df["Item Type"].isin(selected_item_types)]
+        type_summary_df, overall, _unm, _used = build_utilization_summary(master_df, usage_df)
+        for _, row in type_summary_df.iterrows():
+            weekly_rows.append({
+                "Week Label": entry["week_label"],
+                "Date": entry["date"],
+                "Type": row["Type"],
+                "Total": int(row["Total"]),
+                "Used": int(row["Used"]),
+                "Empty": int(row["Empty"]),
+                "Utilization": float(row["Utilization"]),
+            })
+        latest_overall = overall
+        latest_per_type_df = type_summary_df.copy()
+
+    # 把 latest_per_type_df 的 Utilization 轉成百分比字串以便 Excel 表格顯示
+    if latest_per_type_df is not None and "Utilization" in latest_per_type_df.columns:
+        latest_per_type_df["Utilization"] = latest_per_type_df["Utilization"].map(
+            lambda x: f"{x:.2%}" if pd.notna(x) else ""
+        )
+    return {
+        "overall": latest_overall or {},
+        "weekly_trend_df": pd.DataFrame(weekly_rows),
+        "per_type_df": latest_per_type_df if latest_per_type_df is not None else pd.DataFrame(),
+        "latest_week": weekly_data[-1]["week_label"],
+        "latest_date": weekly_data[-1]["date"].strftime("%Y-%m-%d"),
+    }
+
+
+def _render_storage_subsection(report_data, header_text):
+    """渲染一個 Storage 子區塊 (All Item Types 或 Custom)。"""
+    if not report_data:
+        return ""
+    parts = []
+    parts.append(_sub_header(header_text))
+    overall = report_data.get("overall", {})
+    latest_wk = report_data.get("latest_week", "")
+    latest_dt = report_data.get("latest_date", "")
+    parts.append(
+        f'<div style="color:#6b7280;font-size:12px;margin:2px 0 6px;">'
+        f'Latest Week: {latest_wk} (file date {latest_dt})</div>'
+    )
+    overview = {
+        "Total Locations": int(overall.get("total", 0)),
+        "Used": int(overall.get("used", 0)),
+        "Empty": int(overall.get("empty", 0)),
+        "Latest Week Utilization": f"{overall.get('utilization', 0):.2%}",
+    }
+    parts.append(_metric_cards_html(overview))
+    weekly_trend_df = report_data.get("weekly_trend_df", pd.DataFrame())
+    parts.append(_sub_header("Weekly Utilization Trend"))
+    parts.append(_chart_storage_weekly_html(weekly_trend_df))
+    parts.append(_sub_header("Per Storage Type Weekly Utilization"))
+    parts.append(_chart_storage_by_type_html(weekly_trend_df))
+    parts.append(_sub_header(f"Latest Week ({latest_wk}) Per Type"))
+    parts.append(_excel_table_html(report_data.get("per_type_df", pd.DataFrame())))
+    return "".join(parts)
+
+
+def _metric_cards_html(metrics):
+    if not metrics:
+        return ""
+    card = (
+        "display:inline-block;background:#f3f4f6;border:1px solid #e5e7eb;"
+        "border-radius:8px;padding:10px 16px;margin:4px 6px 4px 0;min-width:115px;"
+        "font-family:'Segoe UI',Arial,Helvetica,sans-serif;"
+    )
+    label_s = "font-size:11px;color:#6b7280;display:block;"
+    val_s = "font-size:18px;font-weight:bold;color:#111827;display:block;margin-top:4px;"
+    parts = []
+    for k, v in metrics.items():
+        v_str = f"{v:,}" if isinstance(v, int) else str(v)
+        parts.append(
+            f'<div style="{card}">'
+            f'<span style="{label_s}">{k}</span>'
+            f'<span style="{val_s}">{v_str}</span>'
+            "</div>"
+        )
+    return f'<div style="margin:6px 0 12px;">{"".join(parts)}</div>'
+
+
+def _section_header(num, title):
+    return (
+        f'<h2 style="color:#1f4e78;font-size:17px;margin:22px 0 8px;'
+        f'border-bottom:2px solid #1f4e78;padding-bottom:4px;'
+        f'font-family:\'Segoe UI\',Arial,Helvetica,sans-serif;">'
+        f"{num}. {title}</h2>"
+    )
+
+
+def _sub_header(text):
+    return (
+        f'<h3 style="color:#374151;font-size:14px;margin:14px 0 6px;'
+        f'font-family:\'Segoe UI\',Arial,Helvetica,sans-serif;">{text}</h3>'
+    )
+
+
+def build_email_html_report(to_addr, cc_addr, subject, intro_text, custom_item_types=None):
+    """整合三個分頁的 KPI / 圖表為單頁 HTML 報告 (Outlook 相容)。
+    custom_item_types: None 或 list — Storage 區塊將同時輸出 All Item Types 與 Custom Item Types。
+    """
+    outbound = st.session_state.get("outbound_report")
+    inbound = st.session_state.get("inbound_report")
+    storage = st.session_state.get("storage_report")
+    storage_raw = st.session_state.get("storage_raw")
+
+    now_str = _dt.now().strftime("%Y-%m-%d %H:%M")
+    parts = []
+    parts.append('<div style="font-family:\'Segoe UI\',Arial,Helvetica,sans-serif;'
+                 'color:#1f2937;background:#ffffff;padding:8px 4px;max-width:1100px;">')
+    parts.append(
+        f'<h1 style="color:#111827;font-size:22px;margin:0 0 6px;'
+        f'border-bottom:3px solid #1f4e78;padding-bottom:6px;">{subject or ""}</h1>'
+    )
+    meta_html = (
+        f'<div style="color:#6b7280;font-size:12px;margin-bottom:14px;">'
+        f'Generated: {now_str}　|　To: {to_addr if to_addr else "(unspecified)"}'
+    )
+    if cc_addr:
+        meta_html += f'　|　Cc: {cc_addr}'
+    meta_html += "</div>"
+    parts.append(meta_html)
+    if intro_text:
+        parts.append(
+            f'<div style="background:#fff7ed;border-left:4px solid #f59e0b;'
+            f'padding:10px 14px;border-radius:4px;margin:10px 0 18px;font-size:13px;">'
+            f'{intro_text}</div>'
+        )
+
+    # ===== Outbound (single merged table) =====
+    parts.append(_section_header(1, "Outbound KPI"))
+    if outbound:
+        rng = outbound.get("date_range") or ("", "")
+        parts.append(
+            f'<div style="color:#6b7280;font-size:12px;margin:2px 0 6px;">'
+            f'Date Range: {rng[0]} ~ {rng[1]}</div>'
+        )
+        parts.append(_metric_cards_html(outbound.get("metrics", {})))
+        parts.append(_sub_header("Daily Summary & Visualization"))
+        parts.append(_chart_outbound_html(outbound.get("summary_df", pd.DataFrame())))
+    else:
+        parts.append('<p style="color:#9ca3af;">尚未在 Outbound KPI 分頁上傳檔案。</p>')
+
+    # ===== Inbound (single merged table) =====
+    parts.append(_section_header(2, "Inbound KPI"))
+    if inbound:
+        parts.append(_metric_cards_html(inbound.get("metrics", {})))
+        parts.append(_sub_header("Daily Summary & Visualization"))
+        parts.append(_chart_inbound_html(inbound.get("summary_df", pd.DataFrame())))
+        failed = inbound.get("failed_items_df", pd.DataFrame())
+        if isinstance(failed, pd.DataFrame) and not failed.empty:
+            parts.append(_sub_header("Failed Item List"))
+            parts.append(_excel_table_html(failed, max_rows=50))
+    else:
+        parts.append('<p style="color:#9ca3af;">尚未在 Inbound KPI 分頁上傳檔案。</p>')
+
+    # ===== Warehouse Utilization (All Item Types + Custom Item Types) =====
+    parts.append(_section_header(3, "Warehouse Utilization"))
+    if storage_raw:
+        # 3.1 All Item Types
+        all_report = _compute_storage_trend(storage_raw, selected_item_types=None)
+        if all_report:
+            parts.append(_render_storage_subsection(all_report, "3.1  All Item Types"))
+
+        # 3.2 Custom Item Types (only if user provided a non-empty, non-full subset)
+        all_types = storage_raw.get("all_item_types", [])
+        if custom_item_types and 0 < len(custom_item_types) < len(all_types):
+            custom_report = _compute_storage_trend(storage_raw, selected_item_types=custom_item_types)
+            if custom_report:
+                preview = ", ".join(custom_item_types[:5])
+                tail = f" (+{len(custom_item_types)-5} more)" if len(custom_item_types) > 5 else ""
+                sub_title = f"3.2  Custom Item Types — {preview}{tail}"
+                parts.append(_render_storage_subsection(custom_report, sub_title))
+        elif custom_item_types and len(custom_item_types) == len(all_types):
+            parts.append(
+                f'<p style="color:#6b7280;font-size:12px;font-style:italic;margin-top:6px;">'
+                f'(Custom Item Types 與 All Item Types 相同，已合併顯示於 3.1)</p>'
+            )
+    elif storage:
+        # Fallback：tab3 沒存 raw 資料，只有 storage_report 一份
+        overview = {
+            "Total Locations": int(storage.get("overall", {}).get("total", 0)),
+            "Used": int(storage.get("overall", {}).get("used", 0)),
+            "Empty": int(storage.get("overall", {}).get("empty", 0)),
+            "Latest Week Utilization": f"{storage.get('overall', {}).get('utilization', 0):.2%}",
+        }
+        latest_wk = storage.get("latest_week", "")
+        latest_dt = storage.get("latest_date", "")
+        parts.append(
+            f'<div style="color:#6b7280;font-size:12px;margin:2px 0 6px;">'
+            f'Latest Week: {latest_wk} (file date {latest_dt})</div>'
+        )
+        parts.append(_metric_cards_html(overview))
+        weekly_trend_df = storage.get("weekly_trend_df", pd.DataFrame())
+        parts.append(_sub_header("Weekly Utilization Trend"))
+        parts.append(_chart_storage_weekly_html(weekly_trend_df))
+        parts.append(_sub_header("Per Storage Type Weekly Utilization"))
+        parts.append(_chart_storage_by_type_html(weekly_trend_df))
+        parts.append(_sub_header(f"Latest Week ({latest_wk}) Per Type"))
+        parts.append(_excel_table_html(storage.get("per_type_df", pd.DataFrame())))
+    else:
+        parts.append('<p style="color:#9ca3af;">尚未在 Warehouse Utilization 分頁上傳檔案。</p>')
+
+    parts.append(
+        f'<div style="color:#9ca3af;font-size:11px;margin-top:30px;'
+        f'border-top:1px solid #e5e7eb;padding-top:8px;">'
+        f'此報告由 Framework KPI Tool 自動產生於 {now_str}。'
+        f'若需更新內容，請在前三個分頁重新上傳對應資料檔，再回到 Email Report 分頁重新產生。'
+        f"</div>"
+    )
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def build_full_html_document(subject, body_html):
+    """完整 HTML 文件（含 DOCTYPE / head），供下載 .html 用。"""
+    return (
+        "<!DOCTYPE html>\n"
+        "<html lang=\"zh-Hant\"><head><meta charset=\"utf-8\">"
+        f"<title>{subject}</title></head><body>"
+        f"{body_html}"
+        "</body></html>"
+    )
+
+
+def build_eml_bytes(to_addr, cc_addr, subject, html_body, from_addr=None):
+    """產生 .eml 信件檔位元組。
+    加上 X-Unsent: 1 header，雙擊在 Outlook 中會以「草稿」模式開啟。
+    結構：multipart/alternative ( text/plain + text/html )。
+    """
+    msg = _MIMEMultipart("alternative")
+    msg["Subject"] = subject or ""
+    if from_addr:
+        msg["From"] = from_addr
+    msg["To"] = to_addr or ""
+    if cc_addr:
+        msg["Cc"] = cc_addr
+    msg["Date"] = _formatdate(localtime=True)
+    msg["X-Unsent"] = "1"  # Outlook 會將此 EML 開為「未寄出」草稿
+    msg["MIME-Version"] = "1.0"
+
+    plain_fallback = (
+        "您的郵件用戶端不支援 HTML 顯示。\n"
+        "請改用支援 HTML 的郵件程式 (例如 Microsoft Outlook) 開啟此信件。"
+    )
+    msg.attach(_MIMEText(plain_fallback, "plain", "utf-8"))
+    msg.attach(_MIMEText(html_body, "html", "utf-8"))
+    return msg.as_bytes()
+
+
+with tab4:
+    st.subheader("Email Report — 一鍵產生可直接在 Outlook 寄發的 KPI 報告")
+    st.caption(
+        "完成前三個分頁的資料上傳後，回到本頁可一次性匯出整合報告。"
+        " 推薦下載 **.eml 信件檔**：雙擊後 Outlook 會自動以「草稿」模式開啟，"
+        "整份 HTML 報告（含表格 + 視覺化圖表）會內嵌在信件本文，"
+        "你只需檢查收件人後按「傳送」即可。"
+    )
+
+    ready_out = "outbound_report" in st.session_state
+    ready_in = "inbound_report" in st.session_state
+    ready_st = "storage_report" in st.session_state
+    storage_raw_avail = "storage_raw" in st.session_state
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Outbound KPI", "已就緒" if ready_out else "未準備")
+    c2.metric("Inbound KPI", "已就緒" if ready_in else "未準備")
+    c3.metric("Warehouse Utilization", "已就緒" if ready_st else "未準備")
+
+    # ===== Item Type 多選 (Storage 客製化用) =====
+    custom_item_types = None
+    if storage_raw_avail:
+        _storage_raw = st.session_state["storage_raw"]
+        _all_types = _storage_raw.get("all_item_types", [])
+        if _all_types:
+            st.markdown("#### Storage — 客製化 Item Type")
+            st.caption(
+                "報告 Storage 區塊會分成 **3.1 All Item Types** 與 **3.2 Custom Item Types** 兩部分。"
+                "下方可勾選要納入「Custom」分析的 Item Type；若全選或全不選，則只顯示 3.1。"
+            )
+            custom_item_types = st.multiselect(
+                "選擇要納入 Custom 子區塊的 Item Type",
+                options=_all_types,
+                default=_all_types,
+                key="email_custom_item_types",
+                help="多選；可清空或全選代表只顯示 All Item Types。",
+            )
+
+    if not (ready_out or ready_in or ready_st):
+        st.info("請先到前三個分頁上傳資料，回到此頁即可產生整合報告。")
+    else:
+        st.markdown("#### 收件人 / 主旨設定")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            email_to = st.text_input(
+                "To (收件人，多個請用逗號或分號分隔)",
+                value=DEFAULT_EMAIL_TO,
+                key="email_to",
+                help="預設值已填入；可直接編輯。",
+            )
+        with col_b:
+            email_cc = st.text_input(
+                "CC (副本，多個請用逗號或分號分隔)",
+                value=DEFAULT_EMAIL_CC,
+                key="email_cc",
+            )
+
+        email_subject = st.text_input(
+            "Subject (主旨)",
+            value=DEFAULT_EMAIL_SUBJECT + "  " + _dt.now().strftime("%Y-%m-%d"),
+            key="email_subject",
+        )
+        email_intro = st.text_area(
+            "Intro / Note (前言，可選)",
+            value="Hi team,\n\n附上本週 Framework Outbound / Inbound / Warehouse KPI 報告，請查收。",
+            key="email_intro",
+            height=110,
+        )
+
+        if st.button("產生報告", type="primary", key="btn_build_email"):
+            body_html = build_email_html_report(
+                to_addr=email_to.strip(),
+                cc_addr=email_cc.strip(),
+                subject=email_subject.strip(),
+                intro_text=email_intro.replace("\n", "<br>") if email_intro else "",
+                custom_item_types=custom_item_types,
+            )
+            full_html = build_full_html_document(email_subject.strip(), body_html)
+            eml_bytes = build_eml_bytes(
+                to_addr=email_to.strip(),
+                cc_addr=email_cc.strip(),
+                subject=email_subject.strip(),
+                html_body=full_html,
+            )
+            st.session_state["last_email_html"] = full_html
+            st.session_state["last_email_body_html"] = body_html
+            st.session_state["last_email_eml"] = eml_bytes
+            st.success(
+                f"報告已產生：HTML {len(full_html):,} 字元　|　EML {len(eml_bytes):,} bytes。"
+                "在下方下載 .eml，雙擊即可在 Outlook 開啟草稿信件。"
+            )
+
+        body_html = st.session_state.get("last_email_body_html", "")
+        full_html = st.session_state.get("last_email_html", "")
+        eml_bytes = st.session_state.get("last_email_eml", b"")
+
+        if body_html:
+            st.markdown("#### 報告預覽 (Outlook 中將看到的內容)")
+            with st.expander("展開 / 收合預覽", expanded=True):
+                st.components.v1.html(body_html, height=900, scrolling=True)
+
+            stamp = _dt.now().strftime("%Y%m%d_%H%M")
+            col_dl1, col_dl2 = st.columns(2)
+            with col_dl1:
+                st.download_button(
+                    label="下載 .eml 信件檔 (推薦，雙擊直接在 Outlook 開草稿)",
+                    data=eml_bytes,
+                    file_name=f"framework_kpi_report_{stamp}.eml",
+                    mime="message/rfc822",
+                    key="dl_email_eml",
+                    type="primary",
+                    help=(
+                        "下載後雙擊 .eml 檔，Outlook 會自動以草稿模式開啟，"
+                        "整份報告含表格與圖表都會在信件本文中。檢查收件人後按『傳送』即可。"
+                    ),
+                )
+            with col_dl2:
+                st.download_button(
+                    label="下載 HTML 報告 (.html) — 備用",
+                    data=full_html.encode("utf-8"),
+                    file_name=f"framework_kpi_report_{stamp}.html",
+                    mime="text/html",
+                    key="dl_email_html",
+                    help="若 .eml 開啟異常，可改下載 .html，用瀏覽器開後 Ctrl+A 全選複製貼到 Outlook。",
+                )
+
+            st.info(
+                "**使用流程**：\n"
+                "1. 點上方「下載 .eml 信件檔」\n"
+                "2. 雙擊下載的 .eml 檔 → Outlook 自動開啟一封草稿\n"
+                "3. 報告內容（表格 + 圖表）已內嵌在信件本文，收件人與主旨也已填好\n"
+                "4. 確認無誤後按「傳送」即可"
+            )
